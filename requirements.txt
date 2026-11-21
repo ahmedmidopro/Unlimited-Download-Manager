@@ -1,0 +1,5 @@
+# Build tools and tray support (all required for the EXE build)
+pyinstaller>=6.0
+pystray>=0.19
+pillow>=10.0
+pywebview>=5.0
