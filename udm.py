@@ -3933,6 +3933,41 @@ def check_for_updates():
     return info
 
 
+def _refresh_icon_cache_once():
+    """Refresh the Windows icon cache once per build, so a new program icon shows on the
+    desktop / taskbar by itself. The exe already carries the new icon; only Explorer's
+    saved copy is stale. Runs in a background thread, never raises, never kills Explorer:
+    ie4uinit clears the cache and SHChangeNotify tells Explorer to re-read the icons."""
+    if not IS_WIN:
+        return
+    try:
+        if G.build_no and CFG.get("icon_refresh_build") == G.build_no:
+            return
+    except Exception:
+        return
+    try:
+        import subprocess
+        sysdir = os.environ.get("SystemRoot", r"C:\Windows")
+        ie = os.path.join(sysdir, "System32", "ie4uinit.exe")
+        if os.path.exists(ie):
+            for param in ("-ClearIconCache", "-show"):
+                try:
+                    subprocess.run([ie, param], timeout=25,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    break
+                except Exception:
+                    continue
+        try:
+            import ctypes
+            ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)
+        except Exception:
+            pass
+        CFG["icon_refresh_build"] = G.build_no
+        save_cfg()
+    except Exception as e:
+        _tray_log(f"icon cache refresh failed: {e!r}")
+
+
 def _auto_update_check():
     """Check once at startup (at most every 6 hours) when the setting is on."""
     if not CFG.get("auto_update_check", True):
@@ -4114,6 +4149,7 @@ def main():
     threading.Thread(target=engine_loop, daemon=True).start()
     threading.Thread(target=clip_loop, daemon=True).start()
     threading.Thread(target=_auto_update_check, daemon=True).start()
+    threading.Thread(target=_refresh_icon_cache_once, daemon=True).start()
     tray = CFG["tray"] and setup_tray()
     if CFG["tray"] and not tray and IS_WIN:
         # the tray icon is what keeps UDM alive after closing the window: if it could
