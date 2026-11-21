@@ -2471,25 +2471,40 @@ function nmCall(msg, ms) {
 async function ensureToken() {
   if (TOKEN) return TOKEN;
   try {   // build without an embedded token: ask UDM (it only answers requests that come from a browser extension)
-    const r = await fetch(BASE + "/ext/pair");
-    if (r.ok) TOKEN = (await r.json()).token || "";
+    const ctrl = new AbortController(); const to = setTimeout(() => ctrl.abort(), 1500);
+    try { const r = await fetch(BASE + "/ext/pair", {signal: ctrl.signal}); if (r.ok) TOKEN = (await r.json()).token || ""; }
+    finally { clearTimeout(to); }
   } catch (e) {}
   return TOKEN;
 }
 const PATH = {add: "/add", addmany: "/addmany", detect: "/video/detect", hello: "/ext/hello", formats: "/video/formats", get: "/video/get"};
-async function call(type, payload, ms) {
-  payload = payload || {};
-  const r = await nmCall({type, payload}, ms);
-  if (r) return {via: "native", data: r.data || {}};
+async function callHttp(type, payload, ms) {
+  // local HTTP: answers in milliseconds while the program is running
   try {
     const tok = await ensureToken();
-    if (type === "rules") { const x = await fetch(BASE + "/rules?token=" + tok); return x.ok ? {via: "http", data: await x.json()} : null; }
-    if (type === "show") { await fetch(BASE + "/show"); return {via: "http", data: {}}; }
-    payload.token = tok;
-    const x = await fetch(BASE + PATH[type], {method: "POST", headers: {"Content-Type": "application/json", "X-UDM-Token": tok},
-                                              body: JSON.stringify(payload)});
-    return x.ok ? {via: "http", data: await x.json().catch(() => ({}))} : null;
+    const ctrl = new AbortController(); const to = setTimeout(() => ctrl.abort(), ms || 2000);
+    try {
+      if (type === "rules") { const x = await fetch(BASE + "/rules?token=" + tok, {signal: ctrl.signal}); return x.ok ? {via: "http", data: await x.json()} : null; }
+      if (type === "show") { await fetch(BASE + "/show", {signal: ctrl.signal}); return {via: "http", data: {}}; }
+      payload = payload || {}; payload.token = tok;
+      const x = await fetch(BASE + PATH[type], {method: "POST", headers: {"Content-Type": "application/json", "X-UDM-Token": tok},
+                                                body: JSON.stringify(payload), signal: ctrl.signal});
+      return x.ok ? {via: "http", data: await x.json().catch(() => ({}))} : null;
+    } finally { clearTimeout(to); }
   } catch (e) { return null; }
+}
+async function call(type, payload, ms) {
+  payload = payload || {};
+  if (type === "rules" || type === "add") {
+    // hot path (every download): local HTTP first — the native host has to start a
+    // Python process, which can stall seconds when the worker just woke up
+    const h = await callHttp(type, payload, ms);
+    if (h) return h;
+  }
+  const r = await nmCall({type, payload}, ms);
+  if (r) return {via: "native", data: r.data || {}};
+  if (type === "rules" || type === "add") return null;   // HTTP already tried and failed
+  return callHttp(type, payload, ms);
 }
 async function detectBrowser() {
   const ua = navigator.userAgent;
@@ -2827,7 +2842,7 @@ button{font:inherit;color:inherit;border:0;background:none;cursor:pointer;paddin
 
 
 # ====================================================================== browser integration (installed from inside UDM, no store)
-EXT_VERSION = "1.5.2"
+EXT_VERSION = "1.5.3"
 HOST_NAME = "com.udm.host"
 EXT_PUBKEY = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAx16FSZLkwo6Ru2hW/X3+uaeZoxojJzWekIRjNWI9SlH4wFiw7U98Ye2Zj7fxUCKRJ7HJbhjSgNMMMWNrST0ZWq5UKvj4aZIVUpCnwwfQdC+05W46uMtqOKh005v7umzm0uYyt3SEK02QYJ2skZeGTD22hDKkaACqWPU0AtVYKiiy5w79aROgjEqq4rooreJH8HBnlM4OVtqn5C159jNDUeoM632Oq+er2qXrD84Ief12gq20gOgLINnkrFvpBI9hifNVq25avAHMwMvSlG8bcVfHvjkVM8dgbBMFZRquPddqEFf3WDTBp7Hs4i/2/ZiaRd222NzO1cL5EakXQw/2+QIDAQAB"
 EXT_ID_FIREFOX = "udm@unlimited.download.manager"
@@ -3295,25 +3310,35 @@ def open_popup(url, referer="", cookies="", video=None):
         G.pending.pop(k, None)
     G.last_popup = now
     link = f"http://127.0.0.1:{CFG['server_port']}/popup?token={CFG['token']}&pid={pid}"
-    if G.win is not None and not G.win_closed:              # the program's own window loop is running
-        try:
-            import webview
-            win = webview.create_window(APP_NAME, link, width=800, height=660)
-            G.popups[pid] = win
-            win.events.closed += lambda *a: G.popups.pop(pid, None)
-            return pid
-        except Exception:
-            pass
-    exe, (sw, sh), (w, h) = find_browser(), screen_size(), (800, 660)
-    if exe:
-        try:
-            subprocess.Popen([exe, f"--app={link}", f"--window-size={w},{h}", f"--window-position={max(0, (sw - w) // 2)},{max(0, (sh - h) // 2 - 20)}",
-                              "--no-first-run", f"--user-data-dir={os.path.join(APP_DIR, 'profile')}"])
-            return pid
-        except OSError:
-            pass
-    webbrowser.open(link)
+    threading.Thread(target=_open_popup_window, args=(pid, link), daemon=True).start()
     return pid
+
+
+def _open_popup_window(pid, link):
+    """Create the popup window on a background thread: opening a native window can take a
+    second or two, and the request that asked for it (/add, /video/get) must answer at once
+    so the browser extension is not left waiting."""
+    try:
+        if G.win is not None and not G.win_closed:              # the program's own window loop is running
+            try:
+                import webview
+                win = webview.create_window(APP_NAME, link, width=800, height=660)
+                G.popups[pid] = win
+                win.events.closed += lambda *a: G.popups.pop(pid, None)
+                return
+            except Exception:
+                pass
+        exe, (sw, sh), (w, h) = find_browser(), screen_size(), (800, 660)
+        if exe:
+            try:
+                subprocess.Popen([exe, f"--app={link}", f"--window-size={w},{h}", f"--window-position={max(0, (sw - w) // 2)},{max(0, (sh - h) // 2 - 20)}",
+                                  "--no-first-run", f"--user-data-dir={os.path.join(APP_DIR, 'profile')}"])
+                return
+            except OSError:
+                pass
+        webbrowser.open(link)
+    except Exception:
+        pass
 
 
 def capture_incoming(p):
