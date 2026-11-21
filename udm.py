@@ -2507,7 +2507,7 @@ async function cookieHeader(url) {
 
 /* ---- keep the link alive and tell UDM we are here ---- */
 B.alarms.create("udm-hello", {periodInMinutes: 0.5});
-B.alarms.onAlarm.addListener((a) => { if (a.name === "udm-hello") { nmConnect(); hello(); } });
+B.alarms.onAlarm.addListener((a) => { if (a.name === "udm-hello") { nmConnect(); hello(); loadRules(); } });
 B.runtime.onStartup.addListener(() => hello());
 B.runtime.onInstalled.addListener(() => { hello(); makeMenus(); });
 hello();
@@ -2515,12 +2515,12 @@ hello();
 /* ---- capture browser downloads ---- */
 let lastCap = "";
 function note(msg) { lastCap = new Date().toLocaleTimeString() + "  " + msg; hello(); }
-let rulesOk = false;
-async function loadRules() { const r = await call("rules"); if (r && r.data && r.data.types) { rules = r.data; rulesOk = true; } else rulesOk = false; }
+let rulesOk = false, rulesAt = 0;
+async function loadRules(ms) { if (rulesOk && Date.now() - rulesAt < 30000) return; const r = await call("rules", null, ms); if (r && r.data && r.data.types) { rules = r.data; rulesOk = true; rulesAt = Date.now(); } else rulesOk = false; }
 const nameOf = (x) => ((x.filename || x.finalUrl || x.url || "").split(/[\\/]/).pop() || "").split("?")[0];
-async function decideDownload(item) {           // null = leave it to the browser
+async function decideDownload(item, early) {           // null = leave it to the browser
   if (item.byExtensionId) return null;
-  await loadRules();
+  await loadRules(2000);                 // cached rules: no network wait on the hot path
   if (!rulesOk) { note("UDM did not answer, so the browser kept the download"); return null; }
   if (!rules.enabled) { note("capture is switched off in UDM"); return null; }
   let it = item;
@@ -2529,7 +2529,7 @@ async function decideDownload(item) {           // null = leave it to the browse
   let host = ""; try { host = new URL(url).hostname; } catch (e) {}
   if (rules.excluded_sites.some((p) => wc(p).test(host)) || rules.exceptions.some((p) => wc(p).test(url))) { note("skipped (excluded site / URL): " + host); return null; }
   let ext = (nameOf(it).split(".").pop() || "").toLowerCase();
-  if (!rules.types.includes(ext)) {                         // the real file name is often not known yet: look again
+  if (!rules.types.includes(ext) && !early) {              // the real file name is often not known yet: look again
     await new Promise((r) => setTimeout(r, 600));
     try { const f = (await B.downloads.search({id: item.id}))[0]; if (f) it = f; } catch (e) {}
     ext = (nameOf(it).split(".").pop() || "").toLowerCase();
@@ -2541,7 +2541,7 @@ async function decideDownload(item) {           // null = leave it to the browse
   return {url, referer: it.referrer || "", name: nameOf(it)};
 }
 async function sendDownload(item, d) {          // true once UDM has it and the browser copy is gone
-  const r = await call("add", {url: d.url, referer: d.referer, cookies: await cookieHeader(d.url)});
+  const r = await call("add", {url: d.url, referer: d.referer, cookies: await cookieHeader(d.url)}, 2000);
   if (!r) { note("UDM did not answer, so the browser kept: " + d.name); return false; }
   B.downloads.cancel(item.id); B.downloads.erase({id: item.id}); note("sent to UDM: " + d.name);
   return true;
@@ -2555,7 +2555,7 @@ if (DECIDE_EARLY) {
     let answered = false;
     const keep = () => { if (!answered) { answered = true; try { suggest(); } catch (e) {} } };
     const guard = setTimeout(keep, 9000);       // never leave the browser waiting long
-    decideDownload(item).then(async (d) => {
+    decideDownload(item, true).then(async (d) => {
       if (!d) { clearTimeout(guard); keep(); return; }
       const ok = await sendDownload(item, d);
       clearTimeout(guard);
@@ -2827,7 +2827,7 @@ button{font:inherit;color:inherit;border:0;background:none;cursor:pointer;paddin
 
 
 # ====================================================================== browser integration (installed from inside UDM, no store)
-EXT_VERSION = "1.5.1"
+EXT_VERSION = "1.5.2"
 HOST_NAME = "com.udm.host"
 EXT_PUBKEY = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAx16FSZLkwo6Ru2hW/X3+uaeZoxojJzWekIRjNWI9SlH4wFiw7U98Ye2Zj7fxUCKRJ7HJbhjSgNMMMWNrST0ZWq5UKvj4aZIVUpCnwwfQdC+05W46uMtqOKh005v7umzm0uYyt3SEK02QYJ2skZeGTD22hDKkaACqWPU0AtVYKiiy5w79aROgjEqq4rooreJH8HBnlM4OVtqn5C159jNDUeoM632Oq+er2qXrD84Ief12gq20gOgLINnkrFvpBI9hifNVq25avAHMwMvSlG8bcVfHvjkVM8dgbBMFZRquPddqEFf3WDTBp7Hs4i/2/ZiaRd222NzO1cL5EakXQw/2+QIDAQAB"
 EXT_ID_FIREFOX = "udm@unlimited.download.manager"
@@ -2957,7 +2957,7 @@ def refresh_extensions():
     for b in BROWSERS:
         sp = os.path.join(ext_dir(b), ".stamp")
         try:
-            if os.path.exists(sp) and open(sp).read() != _stamp():
+            if os.path.isdir(ext_dir(b)) and (not os.path.exists(sp) or open(sp).read() != _stamp()):
                 prepare_extension(b)
         except OSError:
             pass
