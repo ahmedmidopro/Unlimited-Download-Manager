@@ -5,7 +5,7 @@ Unlimited Download Manager (UDM)
 A multi-connection download manager for Windows (64-bit) written in pure
 Python 3.8+ (standard library only; optional: pystray + Pillow for tray icon).
 """
-import os, re, sys, io, json, time, uuid, shutil, fnmatch, base64, secrets, threading, queue
+import os, re, sys, io, json, time, uuid, shutil, fnmatch, base64, secrets, threading, queue, tempfile
 import subprocess, zipfile, ftplib, http.cookiejar, html.parser, datetime, argparse, hashlib, email.utils
 import urllib.request, urllib.parse, urllib.error
 import http.server, http.client, socketserver
@@ -72,6 +72,7 @@ DEFAULT_CFG = {
     "silent": False, "show_progress": True, "minimized_progress": False, "notify": True,
     "sounds": True, "sound_done": "", "sound_error": "", "confirm_delete": True,
     "startup": False, "tray": True, "remember_dir": True,
+    "auto_update_check": True, "last_update_check": 0,
     "av_enabled": False, "av_command": "", "av_args": '"{file}"',
     "categories": DEFAULT_CATS, "logins": [],        # [{"pattern","user","pass"}]
     "columns": ["name", "size", "pct", "status", "speed", "eta", "resume", "cat", "queue", "added"],
@@ -3111,7 +3112,8 @@ import webbrowser
 
 G = types.SimpleNamespace(mgr=None, last_poll=0.0, started=time.time(), events=[], incoming=[], quit=False,
                           tray=None, proc=None, prev={}, last_clip="", server=None, notified=False, videos=[], ext={},
-                          pending={}, last_popup=0.0, recent={}, win=None, win_closed=False, want_ui=False)
+                          pending={}, last_popup=0.0, recent={}, win=None, win_closed=False, want_ui=False,
+                          build_no=0, update=None, update_dl=None)
 KINDS = {}
 
 
@@ -3341,7 +3343,7 @@ def ui_state():
             "theme": CFG["theme"], "language": CFG["language"], "vcount": len(G.videos),
             "palette": CFG["palette"], "text_size": CFG["text_size"], "limit": CFG["speed_limit_kb"], "limit_saved": CFG["limit_saved"],
             "ext": ext_summary(), "capture": CFG["capture_enabled"], "mode": CFG["speed_mode"], "ver": APP_VER,
-            "conns": sum(t.nworkers for t in act)}
+            "conns": sum(t.nworkers for t in act), "upd": update_ui_state()}
 
 
 def video_detect(b):
@@ -3752,6 +3754,17 @@ def ui_act(b):
         return dict(ext_browser_info(k), reg=reg)
     elif op == "win":
         return win_control(b.get("what"), b.get("prefix"))
+    elif op == "update_check":
+        return check_for_updates()
+    elif op == "update_download":
+        if not (G.update and G.update.get("available")):
+            return {"ok": False, "error": "no update"}
+        if (G.update_dl or {}).get("state") == "downloading":
+            return {"ok": True}
+        threading.Thread(target=_download_update, daemon=True).start()
+        return {"ok": True}
+    elif op == "update_install":
+        return _install_update()
     elif op == "cancel_shutdown":
         subprocess.Popen("shutdown /a", shell=True)
     elif op == "quit":
@@ -3856,6 +3869,141 @@ def engine_loop():
                 pass
 
 
+# ------------------------------------------------------------------ self-update from GitHub releases
+UPD_REPO = "ahmedmidopro/Unlimited-Download-Manager"
+UPD_API = "https://api.github.com/repos/" + UPD_REPO + "/releases/latest"
+
+
+def _build_number():
+    """The build number stamped into the app at build time (build.txt next to the exe).
+    0 means unknown (an older build without the stamp): any release counts as newer."""
+    bases = []
+    if getattr(sys, "frozen", False):
+        bases.append(os.path.dirname(sys.executable))
+    bases.append(getattr(sys, "_MEIPASS", ""))
+    bases.append(os.path.dirname(os.path.abspath(__file__)))
+    for base in bases:
+        if not base:
+            continue
+        try:
+            with open(os.path.join(base, "build.txt"), "r", encoding="utf-8") as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            continue
+    return 0
+
+
+def _github_latest_release():
+    req = urllib.request.Request(UPD_API, headers={"User-Agent": APP_NAME, "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def check_for_updates():
+    """Ask GitHub for the latest release and compare it with this build. Never raises."""
+    try:
+        rel = _github_latest_release()
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
+    tag = str(rel.get("tag_name") or "")
+    m = re.match(r"build-(\d+)", tag)
+    latest = int(m.group(1)) if m else 0
+    setup_url, setup_size, portable_url = "", 0, ""
+    for a in rel.get("assets") or []:
+        if a.get("name") == "UDM-Setup.exe":
+            setup_url = a.get("browser_download_url") or ""
+            setup_size = a.get("size") or 0
+        elif a.get("name") == "UDM-Portable.zip":
+            portable_url = a.get("browser_download_url") or ""
+    info = {"ok": True, "available": latest > G.build_no, "latest": latest, "current": G.build_no,
+            "tag": tag, "notes": (rel.get("body") or "")[:600],
+            "setup_url": setup_url, "setup_size": setup_size, "portable_url": portable_url}
+    G.update = info
+    CFG["last_update_check"] = time.time()
+    save_cfg()
+    return info
+
+
+def _auto_update_check():
+    """Check once at startup (at most every 6 hours) when the setting is on."""
+    if not CFG.get("auto_update_check", True):
+        return
+    if time.time() - CFG.get("last_update_check", 0) < 6 * 3600:
+        return
+    try:
+        check_for_updates()
+    except Exception:
+        pass
+
+
+def _download_update():
+    """Download the new installer in the background; progress lands in G.update_dl."""
+    info = G.update or {}
+    if not info.get("setup_url"):
+        return
+    G.update_dl = {"state": "downloading", "pct": 0}
+    try:
+        tmp = os.path.join(tempfile.gettempdir(), "UDM-Setup.exe")
+        req = urllib.request.Request(info["setup_url"], headers={"User-Agent": APP_NAME})
+        with urllib.request.urlopen(req, timeout=30) as r, open(tmp, "wb") as f:
+            total = int(r.headers.get("Content-Length") or info.get("setup_size") or 0)
+            done = 0
+            while True:
+                chunk = r.read(1024 * 256)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if total:
+                    G.update_dl["pct"] = round(done * 100 / total)
+        G.update_dl = {"state": "ready", "path": tmp}
+    except Exception as e:
+        G.update_dl = {"state": "error", "error": str(e)[:120]}
+
+
+def _is_installed_version():
+    """True when running from an Inno Setup install (the uninstaller sits next to the exe)."""
+    if not getattr(sys, "frozen", False):
+        return False
+    return os.path.exists(os.path.join(os.path.dirname(sys.executable), "unins000.exe"))
+
+
+def _install_update():
+    """Start the downloaded installer and quit: a helper waits for this process to exit,
+    installs silently, then starts the new version. Returns a dict for the UI."""
+    dl = G.update_dl or {}
+    if dl.get("state") != "ready" or not os.path.exists(dl.get("path", "")):
+        return {"ok": False, "error": "not downloaded"}
+    if not IS_WIN or not _is_installed_version():
+        return {"ok": False, "error": "portable"}   # portable copy: the user installs the new zip by hand
+    bat = os.path.join(tempfile.gettempdir(), "udm-update.bat")
+    try:
+        with open(bat, "w", encoding="utf-8") as f:
+            f.write("@echo off\r\n")
+            f.write(":wait\r\n")
+            f.write('tasklist /FI "IMAGENAME eq UDM.exe" 2>nul | find /I "UDM.exe" >nul\r\n')
+            f.write("if %ERRORLEVEL%==0 (timeout /t 1 /nobreak >nul & goto wait)\r\n")
+            f.write(f'"{dl["path"]}" /SILENT\r\n')
+            f.write(f'start "" "{sys.executable}"\r\n')
+            f.write('(goto) 2>nul & del "%~f0"\r\n')
+        os.startfile(bat)
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
+    threading.Thread(target=lambda: (time.sleep(1.5), quit_app()), daemon=True).start()
+    return {"ok": True}
+
+
+def update_ui_state():
+    u = dict(G.update or {})
+    dl = G.update_dl or {}
+    u["dl_state"] = dl.get("state", "idle")
+    u["dl_pct"] = dl.get("pct", 0)
+    u["dl_error"] = dl.get("error", "")
+    u["current"] = G.build_no
+    u["portable"] = not _is_installed_version()
+    return u
+
+
 def _tray_log(msg):
     """Save tray errors next to the settings file, so a missing tray icon can be diagnosed."""
     try:
@@ -3952,9 +4100,11 @@ def main():
         return
     G.mgr = Manager()
     G.mgr.load()
+    G.build_no = _build_number()
     threading.Thread(target=startup_integration, daemon=True).start()
     threading.Thread(target=engine_loop, daemon=True).start()
     threading.Thread(target=clip_loop, daemon=True).start()
+    threading.Thread(target=_auto_update_check, daemon=True).start()
     tray = CFG["tray"] and setup_tray()
     if CFG["tray"] and not tray and IS_WIN:
         # the tray icon is what keeps UDM alive after closing the window: if it could
@@ -8599,7 +8749,7 @@ input:focus,select:focus,textarea:focus{border-color:#4a9cff}select option{backg
 <button class="ib" data-a="bell" id="bell" title="Notifications"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 17V11a6 6 0 1112 0v6l2 2H4z"/><path d="M10 21a2 2 0 004 0"/></svg><i class="dot" hidden></i></button><i class="vsep"></i>
 <button class="ib wc" data-a="min"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/></svg></button><button class="ib wc" data-a="max"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="1.5"/></svg></button><button class="ib wc" data-a="close"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
 <div class="urlrow"><div class="urlbar"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 007 0l3-3a5 5 0 00-7-7l-1 1M14 11a5 5 0 00-7 0l-3 3a5 5 0 007 7l1-1"/></svg><input id="url" type="text" spellcheck="false" autocomplete="off"><button class="chev" data-a="chev"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></button></div>
-<button class="dlbtn" data-a="dl"><svg width="30" height="30" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg><span data-i="Download">Download</span></button></div></header>
+<button class="dlbtn" data-a="dl"><svg width="30" height="30" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg><span data-i="Download">Download</span></button></div><div id="updbar" style="display:none;grid-column:1/4"></div></header>
 <aside><nav id="nav"></nav><div class="art"><img class="wolf" src="data:image/jpeg;base64,__WOLF__" alt=""></div></aside><main class="main" id="main"></main></div><div id="toasts"></div><div class="dz" id="dz" data-i="Drop links or files here to download">Drop links or files here to download</div>
 <script>
 const T="__TOKEN__",$=(s,e=document)=>e.querySelector(s),$$=(s,e=document)=>[...e.querySelectorAll(s)];
@@ -8625,7 +8775,7 @@ const AR={'Unlimited Download Manager':'مدير التحميل غير المح�
 'Queue':'القائمة','Start time (HH:MM, empty = manual)':'وقت البدء (HH:MM، فارغ = يدوي)','Stop time (HH:MM)':'وقت الإيقاف (HH:MM)','Max parallel downloads':'أقصى عدد تحميلات متزامنة','Shut down computer when finished':'إغلاق الجهاز عند الانتهاء','Exit program when finished':'إغلاق البرنامج عند الانتهاء',
 'Project':'المشروع','Start URL':'رابط البداية','Depth (levels)':'العمق (مستويات)','File types (ext list or *)':'أنواع الملفات (امتدادات أو *)','Website filters (wildcards)':'فلاتر المواقع (يدعم *)','Queue (empty = start now)':'القائمة (فارغ = ابدأ الآن)','Run daily at (HH:MM)':'تشغيل يومياً الساعة (HH:MM)','Repeat every N hours (0 = off)':'تكرار كل N ساعة (0 = معطل)','Synchronize: only new / changed files':'مزامنة: الملفات الجديدة أو المتغيرة فقط','Grabber — download websites':'تنزيل المواقع',
 'File name':'اسم الملف','Main download queue':'قائمة التحميل الرئيسية','Synchronization queue':'قائمة المزامنة','Also delete the files from disk':'احذف الملفات من القرص أيضاً',
-'Enter a valid link':'أدخل رابطاً صحيحاً','Saved':'تم الحفظ','Link(s) copied':'تم نسخ الرابط','Download complete':'اكتمل التحميل','Drop links or files here to download':'أفلت الروابط أو الملفات هنا للتحميل','No links found in the dropped item':'لا توجد روابط في العنصر الذي أفلتّه',
+'Enter a valid link':'أدخل رابطاً صحيحاً','Saved':'تم الحفظ','Link(s) copied':'تم نسخ الرابط','Download complete':'اكتمل التحميل','New version available':'نسخة جديدة متاحة','Update now':'حدّث الآن','Install and restart':'ثبّت وأعد التشغيل','Later':'لاحقاً','Check for updates…':'التحقق من التحديثات…','Downloading update…':'جارٍ تنزيل التحديث…','Update downloaded':'تم تنزيل التحديث','You have the latest version':'لديك أحدث نسخة','Could not check for updates':'تعذّر التحقق من التحديثات','Update failed':'فشل التحديث','Installing update…':'جارٍ تثبيت التحديث…','Downloads will pause and resume after the restart':'ستتوقف التحميلات مؤقتاً ويمكن استئنافها بعد إعادة التشغيل','Extract the new portable version over the old folder':'فُكّ ضغط النسخة المحمولة الجديدة فوق المجلد القديم','Drop links or files here to download':'أفلت الروابط أو الملفات هنا للتحميل','No links found in the dropped item':'لا توجد روابط في العنصر الذي أفلتّه',
 'QS':'انسخ أي رابط وستظهر نافذة الإضافة تلقائياً.<br>اسحب الروابط أو الملفات النصية وأفلتها داخل النافذة.<br>استخدم «حمّل لاحقاً» مع الجدولة للتحميل في وقت محدد.<br>القائمة الجانبية ← ربط المتصفح لتوصيل Chrome / Brave / Edge / Firefox.','EXT':'تم إنشاء الإضافة في:','EXT2':'Chrome/Edge ← الإضافات ← وضع المطوّر ← Load unpacked','ABOUT':'مدير التحميل المتكامل','ZIP Preview':'معاينة ZIP','Delete':'حذف','Queue name:':'اسم القائمة:','Video Downloader':'تحميل الفيديو','Video Downloader…':'تحميل الفيديو…','Analyze':'تحليل','Analyzing…':'جاري التحليل…','Detected in browser':'تم اكتشافه في المتصفح','Clear list':'مسح القائمة','No videos detected yet':'لم يتم اكتشاف فيديوهات بعد — شغّل فيديو في المتصفح (مع إضافة UDM)','Direct download':'تحميل مباشر','Quality':'الجودة','Format':'الصيغة','Audio only':'صوت فقط','Download':'تحميل','Estimated size':'الحجم التقديري','Best':'الأفضل','Update yt-dlp':'تحديث yt-dlp','Updating…':'جاري التحديث…','Video download started':'بدأ تحميل الفيديو','Video':'فيديو','Browser Integration':'ربط المتصفح','Browser Integration…':'ربط المتصفح…','Choose your browser':'اختر المتصفح','installed':'مثبّت','not found':'غير موجود','Open the extensions page':'افتح صفحة الإضافات','Open extension folder':'افتح مجلد الإضافة','Copy folder path':'نسخ مسار المجلد','Check Connection':'تحقق من الاتصال','Back':'رجوع','Waiting for the extension…':'بانتظار الإضافة…','Connected successfully':'تم الربط بنجاح','The extension is ready.':'الإضافة جاهزة.','Native host registered':'تم تسجيل الـ Host','Extension files prepared':'تم تجهيز ملفات الإضافة','Extension detected':'تم اكتشاف الإضافة','Connection type':'نوع الاتصال','Native Messaging':'Native Messaging','Local connection (fallback)':'اتصال محلي (احتياطي)','Install the signed add-on':'ثبّت الإضافة الموقّعة','Not connected yet':'لم يتم الاتصال بعد','Test link':'اختبار الرابط','Resume capability':'دعم الاستكمال','Duplicate download link':'الرابط موجود بالفعل في القائمة','Skip':'تخطَّ','Add it with a numbered file name':'أضفه باسم ملف مرقّم','Add it and replace the old download':'أضفه واستبدل التحميل القديم','Speed limit for this download KB/s (0 = none)':'حد السرعة لهذا التحميل كيلوبايت/ث (0 = بلا حد)','Checksum MD5 / SHA-1 / SHA-256 (optional)':'بصمة الملف MD5 / SHA-1 / SHA-256 (اختياري)','Import list…':'استيراد قائمة…','Export list…':'تصدير قائمة…','Export selected':'تصدير المحدد','Copy folder path':'نسخ مسار المجلد','Refresh download address…':'تحديث عنوان التحميل…','Or paste the new address here:':'الصق العنوان الجديد هنا:','Redownload':'إعادة التحميل','Check file (SHA-256)':'فحص الملف (SHA-256)','Limiter: On':'المحدِّد: يعمل','Limiter: Off':'المحدِّد: متوقف','Maximum download speed (KB/s)':'أقصى سرعة تحميل (كيلوبايت/ث)','Once on date (YYYY-MM-DD, empty = every selected day)':'مرة واحدة في تاريخ (YYYY-MM-DD، فارغ = كل الأيام المحددة)','Save all files of this queue to':'احفظ كل ملفات هذه القائمة في','When the queue is done':'عند انتهاء القائمة','Downloads at the same time (0 = no limit)':'تحميلات في نفس الوقت (0 = بلا حد)','If a duplicate link is added':'إذا أُضيف رابط مكرر','Give finished files the date from the server':'اعطِ الملفات المكتملة تاريخ السيرفر','Open each file when it has finished downloading':'افتح كل ملف عند اكتمال تحميله','Color palette':'لوحة الألوان','Text size (%)':'حجم النص (%)','Don\'t go to parent folders':'لا تصعد للمجلدات الأعلى','Download a playlist':'تحميل قائمة تشغيل','Getting the list…':'جاري جلب القائمة…','Check all':'تحديد الكل','Uncheck all':'إلغاء التحديد','Download checked':'حمّل المحدد','Subtitles too':'مع الترجمة','Exact cut':'قص دقيق','From':'من','To':'إلى','default':'افتراضي','ocean':'أزرق المحيط','forest':'أخضر الغابة','purple':'بنفسجي منتصف الليل','rose':'وردي','sunset':'غروب','teal':'فيروزي','neon':'نيون','clay':'طيني','ask':'اسألني','replace':'استبدل','number':'رقّمه','skip':'تخطَّ','exit':'إغلاق البرنامج','sleep':'سكون','hibernate':'إسبات','shutdown':'إيقاف التشغيل'};
 
 const EN={QS:'Copy a link and the Add dialog appears automatically.<br>Drag &amp; drop links or text files into the window.<br>Use “Download Later” + Scheduler for timed downloads.<br>Browser Integration (left menu) to connect Chrome / Brave / Edge / Firefox.',EXT:'Extension created in:',EXT2:'Chrome/Edge → Extensions → Developer mode → Load unpacked',ABOUT:'Unlimited Download Manager'};
@@ -8826,7 +8976,7 @@ const ids=v.map(t=>t.id).join(),old=box.dataset.ids;if(ids!=old){box.dataset.ids
 else v.forEach((t,i)=>{const e=box.children[i],g=sigOf(t);if(e.dataset.sig!=g){e.replaceWith(mkRow(t))}else patchRow(e,t)})}
 function menuAt(el,items,cls=''){$$('.ctx,.dd').forEach(x=>x.remove());const m=document.createElement('div');m.className='dd '+cls;items.forEach(it=>{if(it=='-'){m.append(document.createElement('hr'));return}const d=document.createElement('div');d.innerHTML=(it[2]?ic(it[2],18):'')+'<span>'+L(it[0])+'</span>';d.onclick=()=>{m.remove();it[1]()};m.append(d)});
 document.body.append(m);const r=el.getBoundingClientRect(),w=m.offsetWidth;m.style.top=(r.bottom+6)+'px';const rtl=document.dir=='rtl'||document.documentElement.dir=='rtl';m.style.left=Math.max(8,Math.min(innerWidth-w-8,rtl?r.left:r.right-w))+'px';return m}
-function toolsMenu(el){menuAt(el,[['Add URL / batch',()=>addDlg(),'link'],['Video Downloader…',()=>videoDlg(),'video'],'-',['Queues',queuesDlg,'copy'],['Scheduler',()=>schedDlg(),'cal'],['Grabber…',()=>grabDlg(),'cloud'],'-',['Import list…',importList,'tray'],['Export list…',()=>exportList(sel()),'share'],['Delete completed',()=>api('delcompleted').then(poll),'trash'],'-',[S.limit?'Limiter: On ('+S.limit+' KB/s)':'Limiter: Off',toggleLim,'bolt'],['Quick start',()=>toast(M('QS'),14000),'info']])}
+function toolsMenu(el){menuAt(el,[['Add URL / batch',()=>addDlg(),'link'],['Video Downloader…',()=>videoDlg(),'video'],'-',['Queues',queuesDlg,'copy'],['Scheduler',()=>schedDlg(),'cal'],['Grabber…',()=>grabDlg(),'cloud'],'-',['Import list…',importList,'tray'],['Export list…',()=>exportList(sel()),'share'],['Delete completed',()=>api('delcompleted').then(poll),'trash'],'-',[S.limit?'Limiter: On ('+S.limit+' KB/s)':'Limiter: Off',toggleLim,'bolt'],['Quick start',()=>toast(M('QS'),14000),'info'],['Check for updates…',()=>checkUpdates(),'refresh']])}
 function clearList(){const v=vis();if(!v.length)return;const comp=st.page=='completed',d=document.createElement('div');d.innerHTML=`${v.length} ${L('items will be removed from the list.')}`+(comp?`<label class="chk"><input type="checkbox" id="dfiles"><span>${L('Also delete the files from disk')}</span></label>`:'');
 modal('Clear List',d,[{t:'Cancel'},{t:'Clear List',p:1,fn:async()=>{await api('delete',{ids:v.map(t=>t.id),files:comp&&$('#dfiles').checked});st.sel.clear();poll()}}])}
 /* ---- sidebar ---- */
@@ -8863,6 +9013,21 @@ if(k=='test'){const r=await api('ext_check',{browser:id});toast(r.connected?'✔
 /* ---- top bar ---- */
 async function quickDl(){const i=$('#url'),u=i.value.trim();if(!/^(https?|ftp):\/\//i.test(u))return toast(L('Enter a valid link'));if(isVid(u)){videoDlg(u)}else{await api('popup_new',{url:u})}i.value='';poll()}
 function winCtl(w){api('win',{what:w}).then(r=>{if(r&&r.ok)return;if(w=='max'){document.fullscreenElement?document.exitFullscreen():document.documentElement.requestFullscreen?.()}else if(w=='close')window.close()})}
+/* ---- self-update: a banner under the top bar when a newer build is on GitHub ---- */
+let updDismissed=0;
+function updBar(){const b=$('#updbar');if(!b)return;const u=S.upd||{};if(!u.available||updDismissed==u.latest){if(b.dataset.k){b.dataset.k='';b.style.display='none';b.innerHTML=''}return}
+ const key=u.latest+'|'+u.dl_state+'|'+u.dl_pct+'|'+(u.dl_error||'');if(key==b.dataset.k)return;b.dataset.k=key;b.style.display='block';
+ const bar=inner=>{b.innerHTML=`<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:6px 0 4px;padding:10px 14px;border-radius:12px;background:linear-gradient(90deg,#0d56ff,#2a8cff);color:#fff;font-size:14px">${inner}</div>`};
+ const notes=u.notes?esc(u.notes.split('\n').map(s=>s.trim()).filter(Boolean).slice(0,2).join(' — ').slice(0,200)):'';
+ const later=()=>{updDismissed=u.latest;updBar()};
+ if(u.dl_state=='downloading'){bar(`<b>${L('Downloading update…')}</b><span style="flex:1">${u.dl_pct}%</span>`);return}
+ if(u.dl_state=='ready'){bar(`<b>✔ ${L('Update downloaded')}</b><span style="flex:1">${L('Downloads will pause and resume after the restart')}</span><button class="btn pri" id="upinst">${L('Install and restart')}</button><button class="btn" id="uplate">${L('Later')}</button>`);$('#upinst').onclick=installUpdate;$('#uplate').onclick=later;return}
+ if(u.dl_state=='error'){bar(`<b>⚠ ${L('Update failed')}</b><span style="flex:1">${esc(u.dl_error||'')}</span><button class="btn pri" id="upretry">${L('Try again')}</button><button class="btn" id="uplate">${L('Later')}</button>`);$('#upretry').onclick=startUpdate;$('#uplate').onclick=later;return}
+ bar(`<b>⬆ ${L('New version available')}: build ${u.latest}</b><span style="flex:1;opacity:.9">${notes}</span><button class="btn pri" id="upnow">${L('Update now')}</button><button class="btn" id="uplate">${L('Later')}</button>`);
+ $('#upnow').onclick=startUpdate;$('#uplate').onclick=later}
+async function startUpdate(){const u=S.upd||{};if(u.portable){if(u.portable_url)window.open(u.portable_url,'_blank');toast(L('Extract the new portable version over the old folder'));return}const r=await api('update_download');if(r&&r.ok)toast(L('Downloading update…'));else toast(L('Update failed'))}
+async function installUpdate(){const r=await api('update_install');if(r&&r.ok)toast(L('Installing update…'));else if(r&&r.error=='portable'){const u=S.upd||{};if(u.portable_url)window.open(u.portable_url,'_blank')}else toast(L('Update failed'))}
+async function checkUpdates(){const r=await api('update_check');if(r&&r.ok&&r.available){updDismissed=0;updBar()}else if(r&&r.ok)toast(L('You have the latest version'));else toast(L('Could not check for updates'))}
 function bellMenu(el){unread=0;renderBell();const m=menuAt(el,[],'np');m.innerHTML=`<div class="nh"><span>${L('Notifications')}</span><button class="pill sm" id="nclr">${L('Clear')}</button></div>`+(NOTES.length?NOTES.slice(0,20).map(n=>`<div class="ni" ${n.id?`data-open="${n.id}"`:''}>${n.k=='done'?'<span class="okc">✔</span> ':'<span class="err">⚠</span> '}${esc(n.name)}<small>${esc(n.msg||'')} ${new Date(n.t).toLocaleTimeString()}</small></div>`).join(''):`<div class="ni" style="color:var(--mut)">${L('No notifications')}</div>`);
 const r=el.getBoundingClientRect();m.style.left=Math.max(8,r.right-m.offsetWidth)+'px';$('#nclr',m)?.addEventListener('click',()=>{NOTES=[];m.remove()})}
 function renderBell(){const d=$('#bell .dot');if(d){d.hidden=!unread;d.textContent=unread}}
@@ -8891,7 +9056,7 @@ ctxMenu(e,[['Open',()=>api('open',{ids})],['Open folder',()=>api('folder',{ids})
 document.addEventListener('keydown',e=>{const inp=/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);if(e.key=='Escape')$$('.ov').pop()?.remove();else if(e.key=='Enter'&&document.activeElement.id=='url')quickDl();else if(e.key=='Delete'&&!inp)A.del();else if(e.ctrlKey&&e.key=='a'&&!inp){e.preventDefault();vis().forEach(t=>st.sel.add(t.id));$('#list').dataset.ids='';renderList()}else if(e.ctrlKey&&e.key=='n'){e.preventDefault();addDlg()}});
 /* ---------- polling ---------- */
 async function poll(){try{const s=await(await fetch('/api/state',{headers:{'X-UDM-Token':T}})).json();S=s;if(s.theme&&s.theme!=theme)applyTheme(s.theme);if(s.language&&s.language!=lang)applyLang(s.language);if(s.palette&&s.palette!=pal)applyPal(s.palette);if(s.text_size&&s.text_size!=tsz)applyTS(s.text_size);
-st.sel.forEach(i=>{if(!S.tasks.some(t=>t.id==i))st.sel.delete(i)});render();
+st.sel.forEach(i=>{if(!S.tasks.some(t=>t.id==i))st.sel.delete(i)});render();updBar();
 for(const ev of s.events){if(ev.k=='done'||ev.k=='error'){NOTES.unshift({k:ev.k,id:ev.id,name:ev.name,msg:ev.msg||L('Download complete'),t:Date.now()});unread++;renderBell()}
 if(ev.k=='done'&&S.notify)toast(`✔ ${L('Download complete')}<br><b>${esc(ev.name)}</b><br><a href="#" style="color:#7fc0ff" onclick="api('open',{ids:['${ev.id}']});return false">${L('Open')}</a> · <a href="#" style="color:#7fc0ff" onclick="api('folder',{ids:['${ev.id}']});return false">${L('Open folder')}</a>`,9000);else if(ev.k=='error')toast('⚠ '+esc(ev.name)+'<br>'+esc(ev.msg),9000);else if(ev.k=='shutdown')toast('Queue finished — shutting down in 60 s. <a href="#" style="color:#7fc0ff" onclick="api(\'cancel_shutdown\');return false">Cancel</a>',60000)}
 for(const p of s.incoming)onIncoming(p)}catch(e){}

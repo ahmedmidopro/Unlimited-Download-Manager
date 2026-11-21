@@ -69,6 +69,10 @@ jobs:
           foreach ($f in "yt-dlp.exe","deno.exe","ffmpeg.exe") { if (!(Test-Path "tools/$f")) { throw "$f is missing" } }
           Get-ChildItem tools | Select-Object Name, Length
 
+      - name: Stamp the build number into the app
+        shell: pwsh
+        run: Set-Content -Path build.txt -Value "${{ github.run_number }}" -NoNewline
+
       - name: Build the app folder with PyInstaller
         run: >
           pyinstaller --noconfirm --clean --onedir --windowed
@@ -79,6 +83,7 @@ jobs:
           --collect-data webview
           --collect-submodules pystray
           --collect-all pystray
+          --add-data "build.txt;."
           udm.py
 
       - name: Build the browser host (udm-host.exe)
