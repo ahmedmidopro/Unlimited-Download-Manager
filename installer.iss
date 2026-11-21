@@ -22,6 +22,7 @@ PrivilegesRequiredOverridesAllowed=dialog
 UninstallDisplayIcon={app}\UDM.exe
 WizardStyle=modern
 SetupIconFile=assets\udm.ico
+ChangesAssociations=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -42,6 +43,9 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\UDM.exe"; Parameters: "--register-native"; Flags: runhidden waituntilterminated
+; Refresh the Windows icon cache after install (no postinstall flag, so it also runs on
+; silent installs from the self-updater; runascurrentuser because the cache is per-user)
+Filename: "{sys}\ie4uinit.exe"; Parameters: "-ClearIconCache"; Flags: runascurrentuser nowait skipifdoesntexist
 Filename: "{app}\UDM.exe"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
