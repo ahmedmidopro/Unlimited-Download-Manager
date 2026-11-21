@@ -63,7 +63,7 @@ DEFAULT_CFG = {
     "temp_dir": "", "user_agent": UA, "ignore_mtime": False, "ftp_passive": True,
     "server_limits": "", "proxy_mode": "none",
     "proxy_http": "", "proxy_https": "", "proxy_ftp": "",
-    "proxy_user": "", "proxy_pass": "", "proxy_exclude": "localhost;127.0.0.1",
+    "proxy_user": "", "proxy_pass": "", "proxy_exclude": "localhost;127.0.0.1", "proxy_fallback": True,
     "clipboard_monitor": True,
     "capture_large_mb": 5,           # also capture any file bigger than this, whatever its type (0 = off)
     "capture_types": "zip rar 7z gz tar iso exe msi apk dmg deb pdf doc docx xls xlsx ppt pptx "
@@ -424,12 +424,12 @@ def open_path(p):
 COOKIES = http.cookiejar.CookieJar()
 
 
-def proxy_for(url):
+def proxy_for(url, task=None):
     mode = CFG["proxy_mode"]
-    if mode == "none":
+    if mode == "none" and not (task and getattr(task, "proxy_fallback", False)):
         return None
     scheme = urllib.parse.urlparse(url).scheme.lower()
-    if mode == "system":
+    if mode == "system" or (task and getattr(task, "proxy_fallback", False)):
         p = urllib.request.getproxies().get(scheme)
     else:
         p = CFG.get("proxy_" + scheme, "")
@@ -496,7 +496,7 @@ def http_open(url, headers=None, timeout=None, task=None):
     cred = cred or find_login(url)
     if cred:
         h["Authorization"] = "Basic " + base64.b64encode(f"{cred[0]}:{cred[1]}".encode()).decode()
-    p = proxy_for(url)
+    p = proxy_for(url, task)
     if p and CFG["proxy_user"]:
         h["Proxy-Authorization"] = "Basic " + base64.b64encode(
             f"{CFG['proxy_user']}:{CFG['proxy_pass']}".encode()).decode()
@@ -678,7 +678,7 @@ class Link:
         return h
 
     def get(self, url, extra=None):
-        if proxy_for(url):                                   # proxies: classic path (no pooling)
+        if proxy_for(url, self.task):                                   # proxies: classic path (no pooling)
             self.close()
             self.last = http_open(url, extra, task=self.task)
             return self.last
@@ -762,6 +762,7 @@ class Task:
         self.description = ""
         self.nconn = nconn or CFG["connections"]
         self.filename = self.final_path = self.part_file = self.fixed_name = None
+        self.proxy_fallback = False           # this download already failed once: retry it via the system proxy
         self.overwrite = False
         self.size = None
         self.resumable = False
@@ -1249,6 +1250,8 @@ class Task:
                 raise
             except Exception as e:
                 link.close()
+                if CFG.get("proxy_fallback") and CFG["proxy_mode"] == "none" and not self.proxy_fallback:
+                    self.proxy_fallback = True        # next attempt goes through the system proxy (IDM behaviour)
                 if stop.is_set():
                     return
                 fails = 1 if ws.got else fails + 1                   # progress during the attempt resets the counter
@@ -1269,7 +1272,7 @@ class Task:
                 stop.wait(wait + random.random() * 0.5)
 
     def _block(self):
-        return (8 << 20) if (CFG.get("keepalive", True) and not proxy_for(self.url)) else (1 << 60)
+        return (8 << 20) if (CFG.get("keepalive", True) and not proxy_for(self.url, self)) else (1 << 60)
 
     def _check(self, r, pos):
         st = r.status
@@ -1419,6 +1422,8 @@ class Task:
             self.status = "Paused"
         except Exception as e:
             self.status, self.error = "Error", str(e)
+            if CFG.get("proxy_fallback") and CFG["proxy_mode"] == "none":
+                self.proxy_fallback = True        # a retry goes through the system proxy (IDM behaviour)
         finally:
             self.nworkers = 0
             try:
@@ -1915,14 +1920,14 @@ def update_ytdlp_verified():
         return f"Update failed ({e}) — your version is unchanged"
 
 
-def ytdlp_common(url, referer="", cookies="", playlist=False):
+def ytdlp_common(url, referer="", cookies="", playlist=False, task=None):
     a = ["--no-warnings", "--yes-playlist" if playlist else "--no-playlist", "--socket-timeout", "30"]
     ff, dn = tool_path("ffmpeg"), tool_path("deno")
     if ff:
         a += ["--ffmpeg-location", os.path.dirname(ff)]
     if dn:
         a += ["--js-runtimes", "deno:" + dn]
-    px = proxy_for(url)
+    px = proxy_for(url, task)
     if px:
         if CFG["proxy_user"] and "@" not in px:
             u = urllib.parse.urlparse(px)
@@ -2152,7 +2157,7 @@ class VideoTask(Task):
         lim = self.speed_limit_kb or CFG["speed_limit_kb"]
         if lim > 0:
             c += ["--limit-rate", f"{lim}K"]
-        c += ytdlp_common(self.url, self.referer, self.cookies)
+        c += ytdlp_common(self.url, self.referer, self.cookies, task=self)
         hf = f"[height<={self.vheight}]" if self.vheight else ""
         if self.vfmt and not audio:                         # one exact choice: resolution + fps + codec + container
             fid = re.sub(r"[^A-Za-z0-9_.-]", "", self.vfmt)
@@ -2253,6 +2258,8 @@ class VideoTask(Task):
                 self.on_complete(self)
         except Exception as e:
             self.status, self.error = "Error", str(e)
+            if CFG.get("proxy_fallback") and CFG["proxy_mode"] == "none":
+                self.proxy_fallback = True        # a retry goes through the system proxy (IDM behaviour)
         finally:
             self.nworkers = 0
 # ------------------------------------------------------------------ local server (browser integration / CLI)
@@ -8819,7 +8826,7 @@ const AR={'Unlimited Download Manager':'مدير التحميل غير المح�
 'Connection':'الاتصال','Proxy':'البروكسي','Types & sites':'الأنواع والمواقع','Save to':'مكان الحفظ','Antivirus':'مضاد الفيروسات',
 'Monitor clipboard for links':'مراقبة الحافظة للروابط','Capture downloads from the browser extension':'التقاط التحميلات من إضافة المتصفح','Silent mode (add without asking)':'الوضع الصامت (إضافة بدون سؤال)','Completion notification':'إشعار عند الانتهاء','Sounds':'الأصوات','Start with Windows':'التشغيل مع ويندوز','Keep running in tray when window closes':'الاستمرار في شريط المهام عند إغلاق النافذة','Ask before deleting':'السؤال قبل الحذف',
 'Connections per download (1-32)':'عدد الاتصالات لكل تحميل (1-32)','Timeout (seconds)':'مهلة الاتصال (ثانية)','Retries after error':'عدد المحاولات بعد الخطأ','Speed limit KB/s (0 = unlimited)':'حد السرعة كيلوبايت/ث (0 = بلا حد)','Quota MB (0 = off)':'حصة التحميل ميجابايت (0 = معطلة)','Quota period':'فترة الحصة','FTP passive mode':'وضع FTP السلبي','Ignore modification-time changes on resume':'تجاهل تغيّر تاريخ التعديل عند الاستكمال','Per-server limits — one per line: *.site.com=4':'حدود لكل سيرفر — سطر لكل واحد: *.site.com=4',
-'Mode':'الوضع','HTTP proxy host:port':'بروكسي HTTP (مضيف:منفذ)','HTTPS proxy host:port':'بروكسي HTTPS (مضيف:منفذ)','FTP proxy host:port':'بروكسي FTP (مضيف:منفذ)','No proxy for (;)':'بدون بروكسي لـ (;)',
+'Mode':'الوضع','HTTP proxy host:port':'بروكسي HTTP (مضيف:منفذ)','HTTPS proxy host:port':'بروكسي HTTPS (مضيف:منفذ)','FTP proxy host:port':'بروكسي FTP (مضيف:منفذ)','No proxy for (;)':'بدون بروكسي لـ (;)','If a download fails, retry it using the system proxy':'إذا فشل تحميل، أعد المحاولة باستخدام بروكسي النظام',
 'Captured file types':'أنواع الملفات الملتقطة','Excluded file types':'أنواع ملفات مستثناة','Excluded sites (wildcards)':'مواقع مستثناة (يدعم *)','URL exceptions (wildcards)':'روابط مستثناة (يدعم *)',
 'Temporary folder (empty = next to file)':'المجلد المؤقت (فارغ = بجوار الملف)','Remember last folder per category':'تذكر آخر مجلد لكل تصنيف','Categories — one per line: Name | extensions | folder':'التصنيفات — سطر لكل تصنيف: الاسم | الامتدادات | المجلد','Logins — one per line: site | user | password (encrypted when saved)':'الحسابات — سطر لكل حساب: الموقع | المستخدم | كلمة المرور (تُشفّر عند الحفظ)',
 'Scan files after download':'فحص الملفات بعد التحميل','Antivirus program':'برنامج مضاد الفيروسات','Arguments ({file} = downloaded file)':'المعاملات ({file} = الملف المحمّل)',
@@ -8857,7 +8864,7 @@ const go=now=>async()=>{const v=f.get();if(!/(https?|ftp):\/\//i.test(v.urls)){t
 const o=modal('Add URL',f,[{t:'Cancel'},{t:'Test link',fn:async()=>{const u=($('[name=urls]',f).value.match(/(?:https?|ftp):\/\/\S+/)||[])[0];if(!u)return false;const r=await api('probe',{url:u,referer:$('[name=referer]',f).value,cookies:$('[name=cookies]',f).value});toast(r.err?esc(r.err):`${esc(r.name)}<br>${fs(r.size)} · ${L('Resume capability')}: ${r.resume?'✓':'✗'}`,9000);return false}},{t:'Download Later',fn:go(0)},{t:'Download Now',p:1,fn:go(1)}]),ta=$('[name=urls]',f),chk=()=>{const v=ta.value.trim();if(v&&!/\s/.test(v)&&isVid(v)){o.remove();videoDlg(v,pre)}};ta.addEventListener('paste',()=>setTimeout(chk,60));ta.addEventListener('change',chk)}
 const OPT=[['General',[['language','Language','sel',['en','ar']],['theme','Theme','sel',['dark','light']],['palette','Color palette','sel',['default','ocean','forest','purple','rose','sunset','teal','neon','clay']],['text_size','Text size (%)','num'],['clipboard_monitor','Monitor clipboard for links','chk'],['capture_enabled','Capture downloads from the browser extension','chk'],['silent','Silent mode (add without asking)','chk'],['notify','Completion notification','chk'],['confirm_stop','Warn before stopping a download','chk'],['show_complete','Show a dialog when a download completes','chk'],['startup','Start with Windows','chk'],['tray','Keep running in tray when window closes','chk'],['confirm_delete','Ask before deleting','chk'],['dup_action','If a duplicate link is added','sel',['ask','replace','number','skip']],['server_date','Give finished files the date from the server','chk'],['open_after','Open each file when it has finished downloading','chk']]],
 ['Connection',[['conn_preset','Connection type','sel',['high','medium','low','mobile','custom']],['speed_mode','Speed mode','sel',['auto','manual']],['connections','Connections per download: maximum in Auto mode, fixed number in Manual (1-32)','num'],['host_max_conn','Max connections per website (0 = no limit)','num'],['write_buffer_kb','Disk write buffer per connection (KB)','num'],['keepalive','Reuse connections (Keep-Alive)','chk'],['max_parallel','Downloads at the same time (0 = no limit)','num'],['timeout','Timeout (seconds)','num'],['retries','Retries after error','num'],['speed_limit_kb','Speed limit KB/s (0 = unlimited)','num'],['quota_mb','Quota MB (0 = off)','num'],['quota_period','Quota period','sel',['hour','day']],['user_agent','User-Agent','text'],['ftp_passive','FTP passive mode','chk'],['ignore_mtime','Ignore modification-time changes on resume','chk'],['server_limits','Per-server limits — one per line: *.site.com=4','area']]],
-['Proxy',[['proxy_mode','Mode','sel',['none','system','manual']],['proxy_http','HTTP proxy host:port','text'],['proxy_https','HTTPS proxy host:port','text'],['proxy_ftp','FTP proxy host:port','text'],['proxy_user','Username','text'],['proxy_pass','Password','pass'],['proxy_exclude','No proxy for (;)','text']]],
+['Proxy',[['proxy_mode','Mode','sel',['none','system','manual']],['proxy_http','HTTP proxy host:port','text'],['proxy_https','HTTPS proxy host:port','text'],['proxy_ftp','FTP proxy host:port','text'],['proxy_user','Username','text'],['proxy_pass','Password','pass'],['proxy_exclude','No proxy for (;)','text'],['proxy_fallback','If a download fails, retry it using the system proxy','chk']]],
 ['Types & sites',[['capture_types','Captured file types','area',3],['excluded_types','Excluded file types','area',2],['excluded_sites','Excluded sites (wildcards)','area',2],['url_exceptions','URL exceptions (wildcards)','area',2]]],
 ['Save to',[['temp_dir','Temporary folder (empty = next to file)','text'],['remember_dir','Remember last folder per category','chk'],['cat_folder_follow','Change the category folder when I pick a different folder','chk'],['cats_text','Categories — one per line: Name | extensions | folder','area',6],['logins_text','Logins — one per line: site | user | password (encrypted when saved)','area',3]]],
 ['Antivirus',[['av_enabled','Scan files after download','chk'],['av_command','Antivirus program','text'],['av_args','Arguments ({file} = downloaded file)','text']]],
