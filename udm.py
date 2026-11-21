@@ -3192,7 +3192,7 @@ def open_ui():
     """Show the main window. Returns True when a native program window was used and has
     now closed for good (so the caller should quit when the tray is off)."""
     url = f"http://127.0.0.1:{CFG['server_port']}/ui?token={CFG['token']}"
-    if _try_native_window(url):
+    if _try_native_window(url + "&native=1"):
         return True
     exe = find_browser()
     if exe:
@@ -3287,7 +3287,9 @@ def win_control(what, prefix=None):
 
         def cb(h, _):
             n = u.GetWindowTextLengthW(h)
-            if n and u.IsWindowVisible(h):
+            # a window hidden to the tray is NOT visible: "show" must still find it,
+            # otherwise reopening from the tray / desktop shortcut silently does nothing
+            if n and (what == "show" or u.IsWindowVisible(h)):
                 buf = ctypes.create_unicode_buffer(n + 1)
                 u.GetWindowTextW(h, buf, n + 1)
                 u.GetWindowThreadProcessId(h, ctypes.byref(pid))
@@ -3304,7 +3306,14 @@ def win_control(what, prefix=None):
         if what == "min":
             u.ShowWindow(h, 6)
         elif what == "show":
-            u.ShowWindow(h, 9)                         # restore a hidden / minimized window
+            if u.IsWindowVisible(h):
+                u.ShowWindow(h, 9)                         # restore a minimized window
+            else:
+                u.ShowWindow(h, 5)                         # show a window hidden to the tray
+            try:
+                u.SetForegroundWindow(h)                   # bring it to the front
+            except Exception:
+                pass
         elif what == "max":
             u.ShowWindow(h, 9 if u.IsZoomed(h) else 3)
         elif what == "close":
@@ -9078,8 +9087,10 @@ const urls=[...new Set((txt.match(/(?:https?|ftp):\/\/[^\s"'<>\\]+/g)||[]).map(u
 if(!urls.length)return toast(L('No links found in the dropped item'));onIncoming({urls})});
 
 /* in the native program window the OS title bar already has min/max/close: hide the
-   in-page ones so there is only one X (in a browser tab they stay, there is no title bar) */
-function hideNativeCtrls(){if(window.pywebview){$$('.wc').forEach(b=>b.style.display='none')}}
+   in-page ones so there is only one X (in a browser tab they stay, there is no title bar).
+   Detected from the ?native=1 flag on the URL: window.pywebview does not exist here
+   (no js_api is passed to create_window), so checking it never hides anything. */
+function hideNativeCtrls(){if(window.pywebview||new URLSearchParams(location.search).get('native')){$$('.wc').forEach(b=>b.style.display='none')}}
 hideNativeCtrls();document.addEventListener('pywebviewready',hideNativeCtrls);
 
 $('#thm').onclick=null;applyTheme(theme);applyLang(lang);poll();setInterval(poll,700);
