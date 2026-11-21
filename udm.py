@@ -180,6 +180,9 @@ def load_cfg():
         if CFG.get("host_max_conn") == 16:
             CFG["host_max_conn"] = 32
         CFG["cfg_v"] = 3
+    if CFG.get("cfg_v", 1) < 4:                      # tray must stay on: closing keeps UDM running
+        CFG["tray"] = True
+        CFG["cfg_v"] = 4
     save_cfg()
 
 
@@ -3274,18 +3277,25 @@ def win_control(what, prefix=None):
     try:
         import ctypes
         from ctypes import wintypes
-        u, found = ctypes.windll.user32, []
+        u = ctypes.windll.user32
         proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        mypid = os.getpid()
+        pid = wintypes.DWORD()
+        own, other = [], []                            # our own program window first, browser window second
 
         def cb(h, _):
             n = u.GetWindowTextLengthW(h)
             if n and u.IsWindowVisible(h):
                 buf = ctypes.create_unicode_buffer(n + 1)
                 u.GetWindowTextW(h, buf, n + 1)
-                if (buf.value.startswith(prefix) if prefix else buf.value == APP_NAME):
-                    found.append(h)
+                u.GetWindowThreadProcessId(h, ctypes.byref(pid))
+                if pid.value == mypid:
+                    own.append(h)                      # native pywebview window (same process)
+                elif (buf.value.startswith(prefix) if prefix else buf.value == APP_NAME):
+                    other.append(h)                    # browser --app window with the same title
             return True
         u.EnumWindows(proc(cb), 0)
+        found = own or other
         if not found:
             return {"ok": False}
         h = found[0]
@@ -3846,28 +3856,44 @@ def engine_loop():
                 pass
 
 
+def _tray_log(msg):
+    """Save tray errors next to the settings file, so a missing tray icon can be diagnosed."""
+    try:
+        os.makedirs(APP_DIR, exist_ok=True)
+        with open(os.path.join(APP_DIR, "udm_tray.log"), "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + str(msg) + "\n")
+    except Exception:
+        pass
+
+
 def setup_tray():
     try:
         import pystray
         from PIL import Image
-    except ImportError:
+    except ImportError as e:
+        _tray_log(f"pystray import failed: {e!r}")
         return False
-    img = Image.open(io.BytesIO(base64.b64decode(ICON_B64)))
-    def pause_all():
-        for t in list(G.mgr.tasks.values()):
-            t.pause()
+    try:
+        img = Image.open(io.BytesIO(base64.b64decode(ICON_B64)))
+        def pause_all():
+            for t in list(G.mgr.tasks.values()):
+                t.pause()
 
-    def resume_all():
-        for t in list(G.mgr.tasks.values()):
-            t.start()
-    menu = pystray.Menu(pystray.MenuItem("Open Unlimited Download Manager", lambda: ensure_ui(), default=True),
-                        pystray.MenuItem("Resume all", lambda: resume_all()),
-                        pystray.MenuItem("Pause all", lambda: pause_all()),
-                        pystray.Menu.SEPARATOR,
-                        pystray.MenuItem("Exit", lambda: quit_app()))
-    G.tray = pystray.Icon("udm", img, APP_NAME, menu)
-    G.tray.run_detached()
-    return True
+        def resume_all():
+            for t in list(G.mgr.tasks.values()):
+                t.start()
+        menu = pystray.Menu(pystray.MenuItem("Open Unlimited Download Manager", lambda: ensure_ui(), default=True),
+                            pystray.MenuItem("Resume all", lambda: resume_all()),
+                            pystray.MenuItem("Pause all", lambda: pause_all()),
+                            pystray.Menu.SEPARATOR,
+                            pystray.MenuItem("Exit", lambda: quit_app()))
+        G.tray = pystray.Icon("udm", img, APP_NAME, menu)
+        G.tray.run_detached()
+        return True
+    except Exception as e:
+        _tray_log(f"tray setup failed: {e!r}")
+        G.tray = None
+        return False
 
 
 def quit_app():
@@ -3930,6 +3956,14 @@ def main():
     threading.Thread(target=engine_loop, daemon=True).start()
     threading.Thread(target=clip_loop, daemon=True).start()
     tray = CFG["tray"] and setup_tray()
+    if CFG["tray"] and not tray and IS_WIN:
+        # the tray icon is what keeps UDM alive after closing the window: if it could
+        # not start, say so plainly instead of silently quitting on close
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(0, "تعذّر تشغيل أيقونة شريط المهام، لذلك إغلاق النافذة سيغلق البرنامج تماماً.\nتم حفظ السبب في ملف udm_tray.log بجانب ملف الإعدادات.", APP_NAME, 0x30)
+        except Exception:
+            pass
     if urls:
         G.incoming.append({"urls": urls})
     if not args.minimized or urls:
@@ -8877,6 +8911,11 @@ addEventListener('drop',async e=>{e.preventDefault();pressed=0;dc=0;dz.classList
 for(const f of dt.files){if(f.size<2e6&&/\.(txt|url|html?|csv|lst|list|m3u8?|json|md|xml|webloc)$/i.test(f.name))txt+='\n'+await f.text()}
 const urls=[...new Set((txt.match(/(?:https?|ftp):\/\/[^\s"'<>\\]+/g)||[]).map(u=>u.replace(/[),.;]+$/,'')))];
 if(!urls.length)return toast(L('No links found in the dropped item'));onIncoming({urls})});
+
+/* in the native program window the OS title bar already has min/max/close: hide the
+   in-page ones so there is only one X (in a browser tab they stay, there is no title bar) */
+function hideNativeCtrls(){if(window.pywebview){$$('.wc').forEach(b=>b.style.display='none')}}
+hideNativeCtrls();document.addEventListener('pywebviewready',hideNativeCtrls);
 
 $('#thm').onclick=null;applyTheme(theme);applyLang(lang);poll();setInterval(poll,700);
 
