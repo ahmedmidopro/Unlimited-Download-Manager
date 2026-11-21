@@ -2543,16 +2543,19 @@ async function decideDownload(item, early) {           // null = leave it to the
   if (!/^(https?|ftp):/i.test(url)) return null;                 // blob: / data: / file: stay in the browser
   let host = ""; try { host = new URL(url).hostname; } catch (e) {}
   if (rules.excluded_sites.some((p) => wc(p).test(host)) || rules.exceptions.some((p) => wc(p).test(url))) { note("skipped (excluded site / URL): " + host); return null; }
+  const sizeOf = (x) => (x.totalBytes > 0 ? x.totalBytes : (x.fileSize || 0));
+  const isBig = (x) => { const b = sizeOf(x), m = rules.large_mb || 0; return m > 0 && b >= m * 1048576 && !/^text\//i.test(x.mime || ""); };
+  const binMime = (x) => /^(application\/(octet-stream|x-iso9660-image|x-msdownload|x-rar-compressed|x-7z-compressed|x-tar|x-zip-compressed|zip|gzip|vnd\.android\.package-archive|x-apple-diskimage))$/i.test(x.mime || "");
   let ext = (nameOf(it).split(".").pop() || "").toLowerCase();
-  if (!rules.types.includes(ext) && !early) {              // the real file name is often not known yet: look again
+  if (!rules.types.includes(ext) && !isBig(it) && !binMime(it)) {
+    // the real file name / size is often not known yet (e.g. an ISO whose name has no
+    // extension): look again after a moment — the browser waits, the guard is 9s
     await new Promise((r) => setTimeout(r, 600));
     try { const f = (await B.downloads.search({id: item.id}))[0]; if (f) it = f; } catch (e) {}
     ext = (nameOf(it).split(".").pop() || "").toLowerCase();
   }
-  const bytes = it.totalBytes || it.fileSize || 0, bigMb = rules.large_mb || 0;
-  const big = bigMb > 0 && bytes >= bigMb * 1048576 && !/^text\//i.test(it.mime || "");
   if (rules.excluded_types.includes(ext)) { note('skipped (excluded type "' + ext + '")'); return null; }
-  if (!rules.types.includes(ext) && !big) { note('skipped: type "' + ext + '" is not in the capture list' + (bigMb ? " and the file is smaller than " + bigMb + " MB" : "")); return null; }
+  if (!rules.types.includes(ext) && !isBig(it) && !binMime(it)) { note('skipped: type "' + ext + '" is not in the capture list' + (rules.large_mb ? " and the file is smaller than " + rules.large_mb + " MB" : "")); return null; }
   return {url, referer: it.referrer || "", name: nameOf(it)};
 }
 async function sendDownload(item, d) {          // true once UDM has it and the browser copy is gone
@@ -2842,7 +2845,7 @@ button{font:inherit;color:inherit;border:0;background:none;cursor:pointer;paddin
 
 
 # ====================================================================== browser integration (installed from inside UDM, no store)
-EXT_VERSION = "1.5.3"
+EXT_VERSION = "1.5.4"
 HOST_NAME = "com.udm.host"
 EXT_PUBKEY = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAx16FSZLkwo6Ru2hW/X3+uaeZoxojJzWekIRjNWI9SlH4wFiw7U98Ye2Zj7fxUCKRJ7HJbhjSgNMMMWNrST0ZWq5UKvj4aZIVUpCnwwfQdC+05W46uMtqOKh005v7umzm0uYyt3SEK02QYJ2skZeGTD22hDKkaACqWPU0AtVYKiiy5w79aROgjEqq4rooreJH8HBnlM4OVtqn5C159jNDUeoM632Oq+er2qXrD84Ief12gq20gOgLINnkrFvpBI9hifNVq25avAHMwMvSlG8bcVfHvjkVM8dgbBMFZRquPddqEFf3WDTBp7Hs4i/2/ZiaRd222NzO1cL5EakXQw/2+QIDAQAB"
 EXT_ID_FIREFOX = "udm@unlimited.download.manager"
