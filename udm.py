@@ -3731,6 +3731,9 @@ def ui_act(b):
         info["others"] = [x for x, v in G.ext.items() if x != k and time.time() - v.get("last", 0) < 90]
         return info
     elif op == "popup_new" and re.match(r"^(https?|ftp)://", (b.get("url") or "").strip(), re.I):
+        if not CFG.get("popup_dialog", True):
+            m.add_url(b["url"].strip(), start=True, referer=b.get("referer", ""), cookies=b.get("cookies", ""))
+            return {"ok": True, "started": True}
         open_popup(b["url"].strip(), b.get("referer", ""), b.get("cookies", ""))
         return {"ok": True}
     elif op == "popup_info":
@@ -8962,7 +8965,7 @@ w.addEventListener('keydown',e=>{if(e.key=='Enter'&&e.target.id=='vu')analyze(e.
 w.addEventListener('click',async e=>{const g=s=>e.target.closest(s);let x;
 if(g('#va'))analyze(V('#vu').value);else if(g('#vpl'))loadPl();else if(g('#pla')||g('#plu')){$$('#pll input',w).forEach(c=>c.checked=!!g('#pla'))}else if(g('#pld')){const r=V('#vr')._pl,sel=$$('#pll input:checked',w).map(c=>r.entries[+c.dataset.i]);if(sel.length){await api('vplaylist_dl',{urls:sel.map(e=>e.url),titles:sel.map(e=>e.title),title:r.title,height:+V('#plq').value,cont:V('#plc').value,subs:V('#pls').value});toast(L('Video download started'));poll();o.remove()}}else if(g('#vc')){await api('vclear');drawDet();poll()}
 else if(x=g('[data-an]')){const it=items.find(i=>i.id==x.dataset.an);if(it)analyze(it.url,it.referer,it.cookies)}
-else if(x=g('[data-d]')){const it=items.find(i=>i.id==x.dataset.d);if(it){await api('add',{urls:it.url,category:'Videos',start:1,nconn:S.connections,referer:it.referer,cookies:it.cookies});toast(L('Video download started'));poll()}}
+else if(x=g('[data-d]')){const it=items.find(i=>i.id==x.dataset.d);if(it){const r=await api('popup_new',{url:it.url,referer:it.referer,cookies:it.cookies});if(r.started)toast(L('Video download started'));poll();o.remove()}}
 else if(x=g('[data-h]')){pick.h=+x.dataset.h;drawRes()}else if(x=g('[data-c]')){pick.c=x.dataset.c;drawRes()}
 else if(g('#vg')){const sl=cur.qualities.find(q=>q.h==pick.h);const r=await api('vpopup',{thumb:cur.thumb,url:cur.url,height:pick.h,cont:pick.c,folder:pick.f,start:pick.s,end:pick.e,exact:pick.x,subs:pick.sub,title:cur.title,size:pick.c=='mp3'?cur.audio_size:sl&&sl.size,referer:cur.referer,cookies:cur.cookies});if(r.started)toast(L('Video download started'));poll();o.remove()}
 else if(g('#vup')){toast(L('Updating…'));const r=await api('ytdlp_update');toast(esc(r.out),9000);tools()}});
