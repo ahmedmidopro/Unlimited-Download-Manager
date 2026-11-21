@@ -2102,7 +2102,7 @@ def video_playlist(url, referer="", cookies=""):
 
 class VideoTask(Task):
     """A download handled by yt-dlp (+FFmpeg merge). Pause = stop the process, resume = run it again."""
-    VEXTRA = ("vheight", "vcont", "vtitle", "vsize", "vbase", "vcur", "vfid", "vstart", "vend", "vexact", "vsubs", "vthumb", "vfmt", "vmux")
+    VEXTRA = ("vheight", "vcont", "vtitle", "vsize", "vbase", "vcur", "vfid", "vstart", "vend", "vexact", "vsubs", "vthumb", "vfmt", "vmux", "vout")
 
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
@@ -2112,6 +2112,7 @@ class VideoTask(Task):
         self.vstart, self.vend, self.vexact, self.vsubs = "", "", False, ""
         self.vthumb = ""
         self.vfmt, self.vmux = "", False          # exact yt-dlp format id chosen on the page (and: has audio inside)
+        self.vout = ""                            # exact output name chosen in the download dialog (without extension)
         self.resumable = True
 
     def to_dict(self):
@@ -2141,7 +2142,8 @@ class VideoTask(Task):
             raise RuntimeError("yt-dlp was not found")
         audio = self.vcont == "mp3"
         sec = bool(self.vstart or self.vend)
-        tmpl = "%(title).150B" + ("" if audio else " [%(height)sp]") + (" (part)" if sec else "") + ".%(ext)s"
+        tmpl = (self.vout.replace("%", "%%") + ".%(ext)s") if getattr(self, "vout", "") \
+            else "%(title).150B" + ("" if audio else " [%(height)sp]") + (" (part)" if sec else "") + ".%(ext)s"
         c = [yt, "-q", "--progress", "--newline", "--windows-filenames", "--no-mtime", "--retries", "10",
              "--fragment-retries", "10", "--concurrent-fragments", str(max(1, min(16, CFG["connections"]))),
              "--progress-template", "download:UDMP|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|"
@@ -3238,14 +3240,14 @@ def popup_alive():
     return time.time() - G.last_popup < 15
 
 
-def open_popup(url, referer="", cookies=""):
+def open_popup(url, referer="", cookies="", video=None):
     """The small window of one download (file information, then live progress), like a classic download manager."""
     now = time.time()
     if now - G.recent.get(url, 0) < 4:                      # the browser may report the same click twice
         return
     G.recent[url] = now
     pid = uuid.uuid4().hex[:10]
-    G.pending[pid] = {"url": url, "referer": referer, "cookies": cookies, "t": now}
+    G.pending[pid] = {"url": url, "referer": referer, "cookies": cookies, "t": now, "video": video}
     for k in [k for k, v in G.pending.items() if now - v["t"] > 3600]:
         G.pending.pop(k, None)
     G.last_popup = now
@@ -3629,6 +3631,18 @@ def ui_act(b):
             return video_info(b["url"], b.get("referer", ""), b.get("cookies", ""))
         except Exception as e:
             return {"err": str(e)[:300]}
+    elif op == "vpopup":
+        # a video from the quality picker: ask first in the small download window (like a plain file),
+        # unless the small window is switched off — then start at once, like before
+        if not CFG.get("popup_dialog", True):
+            m.add_task(new_video_task(b["url"], b), start=True)
+            return {"ok": True, "started": True}
+        v = {"height": int(b.get("height") or 0), "cont": (b.get("cont") or "mp4"), "title": b.get("title") or "",
+             "size": b.get("size"), "thumb": b.get("thumb") or "", "folder": (b.get("folder") or "").strip(),
+             "start": b.get("start") or "", "end": b.get("end") or "", "exact": bool(b.get("exact")),
+             "subs": b.get("subs") or ""}
+        open_popup(b["url"].strip(), b.get("referer", ""), b.get("cookies", ""), video=v)
+        return {"ok": True}
     elif op == "vdl":
         m.add_task(new_video_task(b["url"], b), start=True)
     elif op == "vplaylist":
@@ -3726,6 +3740,15 @@ def ui_act(b):
         pd = G.pending.get(b.get("pid"))
         if not pd:
             return {"err": "This download window is no longer valid."}
+        v = pd.get("video")
+        if v:                                       # a video: the name/size are already known, no probing
+            cont = v.get("cont") or "mp4"
+            ext = "mp3" if cont == "mp3" else cont
+            name = safe_name(v.get("title") or "video") + "." + ext
+            cat = "Musics" if cont == "mp3" else "Videos"
+            folder = v.get("folder") or category_folder(cat)
+            return {"name": name, "size": v.get("size"), "resume": True, "err": "", "host": url_host(pd["url"]),
+                    "ssl": ssl_state(pd["url"]), "category": cat, "folder": folder, "path": os.path.join(folder, name)}
         t = Task(pd["url"], DEFAULT_DIR, None)
         t.referer, t.cookies = pd["referer"], pd["cookies"]
         guess = safe_name(urllib.parse.unquote(os.path.basename(urllib.parse.urlparse(pd["url"]).path)) or "download")
@@ -3747,6 +3770,21 @@ def ui_act(b):
         folder, name = (os.path.dirname(path) or None), os.path.basename(path)
         cat = b.get("category") if b.get("category") in CFG["categories"] else "Uncategorized"
         n = b.get("nconn")
+        if pd.get("video"):
+            v = dict(pd["video"])
+            v["folder"] = folder
+            v["referer"], v["cookies"] = pd["referer"], pd["cookies"]
+            t = new_video_task(pd["url"], v)
+            t.nconn = max(1, min(32, int(n or CFG["connections"])))
+            t.category = cat
+            out = safe_name(os.path.splitext(name)[0][:150]) if name else ""
+            t.vout = out
+            if out:
+                t.filename = out + "." + ("mp3" if t.vcont == "mp3" else t.vcont)
+            t.post_action = b.get("after") if b.get("after") in ("open", "folder") else ""
+            m.add_task(t, start=not b.get("later"))
+            pd["task"] = t.id
+            return {"id": t.id}
         t = m.add_url(pd["url"], folder=folder, category=cat, filename=name or None, nconn=max(1, min(32, int(n or CFG["connections"]))),
                       start=not b.get("later"), referer=pd["referer"], cookies=pd["cookies"])
         t.post_action = b.get("after") if b.get("after") in ("open", "folder") else ""
@@ -8919,7 +8957,7 @@ if(g('#va'))analyze(V('#vu').value);else if(g('#vpl'))loadPl();else if(g('#pla')
 else if(x=g('[data-an]')){const it=items.find(i=>i.id==x.dataset.an);if(it)analyze(it.url,it.referer,it.cookies)}
 else if(x=g('[data-d]')){const it=items.find(i=>i.id==x.dataset.d);if(it){await api('add',{urls:it.url,category:'Videos',start:1,nconn:S.connections,referer:it.referer,cookies:it.cookies});toast(L('Video download started'));poll()}}
 else if(x=g('[data-h]')){pick.h=+x.dataset.h;drawRes()}else if(x=g('[data-c]')){pick.c=x.dataset.c;drawRes()}
-else if(g('#vg')){const sl=cur.qualities.find(q=>q.h==pick.h);await api('vdl',{thumb:cur.thumb,url:cur.url,height:pick.h,cont:pick.c,folder:pick.f,start:pick.s,end:pick.e,exact:pick.x,subs:pick.sub,title:cur.title,size:pick.c=='mp3'?cur.audio_size:sl&&sl.size,referer:cur.referer,cookies:cur.cookies});toast(L('Video download started'));poll();o.remove()}
+else if(g('#vg')){const sl=cur.qualities.find(q=>q.h==pick.h);const r=await api('vpopup',{thumb:cur.thumb,url:cur.url,height:pick.h,cont:pick.c,folder:pick.f,start:pick.s,end:pick.e,exact:pick.x,subs:pick.sub,title:cur.title,size:pick.c=='mp3'?cur.audio_size:sl&&sl.size,referer:cur.referer,cookies:cur.cookies});if(r.started)toast(L('Video download started'));poll();o.remove()}
 else if(g('#vup')){toast(L('Updating…'));const r=await api('ytdlp_update');toast(esc(r.out),9000);tools()}});
 drawDet();tools();const iv=setInterval(()=>{if(!document.body.contains(w))clearInterval(iv);else drawDet()},3000);
 if(u0)analyze(u0,ctx.referer||'',ctx.cookies||'')}
