@@ -3166,10 +3166,11 @@ def find_browser():
         for env in ("ProgramFiles(x86)", "ProgramFiles", "LocalAppData"):
             b = os.environ.get(env)
             if b:
-                cands += [os.path.join(b, "Google", "Chrome", "Application", "chrome.exe"),
+                cands += [os.path.join(b, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+                          os.path.join(b, "Google", "Chrome", "Application", "chrome.exe"),
                           os.path.join(b, "Microsoft", "Edge", "Application", "msedge.exe")]
     else:
-        cands = [shutil.which(x) or "" for x in ("microsoft-edge", "google-chrome", "chromium", "chromium-browser")]
+        cands = [shutil.which(x) or "" for x in ("brave-browser", "brave", "google-chrome", "microsoft-edge", "chromium", "chromium-browser")]
     return next((c for c in cands if c and os.path.exists(c)), None)
 
 
