@@ -2367,7 +2367,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"err": str(e)[:200]}).encode())
         if path == "/add" and body.get("url"):
             capture_incoming({"urls": [body["url"]], "referer": body.get("referer", ""), "cookies": body.get("cookies", ""),
-                              "video": bool(body.get("video")), "title": body.get("title", "")})
+                              "video": bool(body.get("video")), "title": body.get("title", ""),
+                              "name": body.get("name", ""), "size": body.get("size"), "mime": body.get("mime", "")})
         elif path == "/addmany" and body.get("urls"):
             capture_incoming({"urls": body["urls"], "referer": body.get("referer", ""), "cookies": body.get("cookies", "")})
         else:
@@ -2556,10 +2557,10 @@ async function decideDownload(item, early) {           // null = leave it to the
   }
   if (rules.excluded_types.includes(ext)) { note('skipped (excluded type "' + ext + '")'); return null; }
   if (!rules.types.includes(ext) && !isBig(it) && !binMime(it)) { note('skipped: type "' + ext + '" is not in the capture list' + (rules.large_mb ? " and the file is smaller than " + rules.large_mb + " MB" : "")); return null; }
-  return {url, referer: it.referrer || "", name: nameOf(it)};
+  return {url, referer: it.referrer || "", name: nameOf(it), size: sizeOf(it) || null, mime: it.mime || ""};
 }
 async function sendDownload(item, d) {          // true once UDM has it and the browser copy is gone
-  const r = await call("add", {url: d.url, referer: d.referer, cookies: await cookieHeader(d.url)}, 2000);
+  const r = await call("add", {url: d.url, referer: d.referer, cookies: await cookieHeader(d.url), name: d.name, size: d.size, mime: d.mime}, 2000);
   if (!r) { note("UDM did not answer, so the browser kept: " + d.name); return false; }
   B.downloads.cancel(item.id); B.downloads.erase({id: item.id}); note("sent to UDM: " + d.name);
   return true;
@@ -2845,7 +2846,7 @@ button{font:inherit;color:inherit;border:0;background:none;cursor:pointer;paddin
 
 
 # ====================================================================== browser integration (installed from inside UDM, no store)
-EXT_VERSION = "1.5.4"
+EXT_VERSION = "1.5.5"
 HOST_NAME = "com.udm.host"
 EXT_PUBKEY = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAx16FSZLkwo6Ru2hW/X3+uaeZoxojJzWekIRjNWI9SlH4wFiw7U98Ye2Zj7fxUCKRJ7HJbhjSgNMMMWNrST0ZWq5UKvj4aZIVUpCnwwfQdC+05W46uMtqOKh005v7umzm0uYyt3SEK02QYJ2skZeGTD22hDKkaACqWPU0AtVYKiiy5w79aROgjEqq4rooreJH8HBnlM4OVtqn5C159jNDUeoM632Oq+er2qXrD84Ief12gq20gOgLINnkrFvpBI9hifNVq25avAHMwMvSlG8bcVfHvjkVM8dgbBMFZRquPddqEFf3WDTBp7Hs4i/2/ZiaRd222NzO1cL5EakXQw/2+QIDAQAB"
 EXT_ID_FIREFOX = "udm@unlimited.download.manager"
@@ -3158,7 +3159,7 @@ def ext_browser_info(key):
             "host_registered": native_registered(key), "connected": connected, "age": age,
             "ext_installed": bool(connected or det["found"] or seen), "ext_disabled": det["disabled"] and not connected,
             "seen_at": rec.get("last") or seen or None, "win": IS_WIN,
-            "via": rec.get("via"), "ext_version": rec.get("version"), "last_cap": rec.get("last_cap", ""),
+            "via": rec.get("via"), "ext_version": rec.get("version"), "ext_latest": EXT_VERSION, "last_cap": rec.get("last_cap", ""),
             "signed_xpi": os.path.exists(os.path.join(ext_root(), "udm-firefox-signed.xpi")) or os.path.exists(bundled_signed_xpi())
             if b["family"] == "firefox" else False,
             "xpi": os.path.join(ext_root(), "udm-firefox.xpi") if b["family"] == "firefox" else None}
@@ -3299,16 +3300,18 @@ def popup_alive():
     return time.time() - G.last_popup < 15
 
 
-def open_popup(url, referer="", cookies="", video=None):
+def open_popup(url, referer="", cookies="", video=None, known=None):
     """The small window of one download (file information, then live progress), like a classic download manager.
     It is the program's own window (pywebview, same as the main window) — not a browser window at all.
-    A browser is only a fallback for when the program's own window loop is not running."""
+    A browser is only a fallback for when the program's own window loop is not running.
+    `known` is what the browser extension already knew (name/size/mime): the window shows it
+    at once, like IDM does, and the network probe only refines it afterwards."""
     now = time.time()
     if now - G.recent.get(url, 0) < 4:                      # the browser may report the same click twice
         return
     G.recent[url] = now
     pid = uuid.uuid4().hex[:10]
-    G.pending[pid] = {"url": url, "referer": referer, "cookies": cookies, "t": now, "video": video}
+    G.pending[pid] = {"url": url, "referer": referer, "cookies": cookies, "t": now, "video": video, "known": known}
     for k in [k for k, v in G.pending.items() if now - v["t"] > 3600]:
         G.pending.pop(k, None)
     G.last_popup = now
@@ -3349,7 +3352,8 @@ def capture_incoming(p):
     urls = p.get("urls") or []
     if len(urls) == 1 and not p.get("video") and not CFG["silent"] and CFG.get("popup_dialog", True) \
             and re.match(r"^(https?|ftp)://", urls[0], re.I):
-        open_popup(urls[0], p.get("referer", ""), p.get("cookies", ""))
+        known = {"name": p.get("name", ""), "size": p.get("size"), "mime": p.get("mime", "")} if p.get("name") else None
+        open_popup(urls[0], p.get("referer", ""), p.get("cookies", ""), known=known)
     else:
         push_incoming(p)
 
@@ -3814,10 +3818,18 @@ def ui_act(b):
         pd = G.pending.get(b.get("pid"))
         if not pd:
             return {"err": "This download window is no longer valid."}
-        return {"url": pd["url"], "host": url_host(pd["url"]), "ssl": ssl_state(pd["url"]), "lang": CFG["language"], "theme": CFG["theme"],
+        d = {"url": pd["url"], "host": url_host(pd["url"]), "ssl": ssl_state(pd["url"]), "lang": CFG["language"], "theme": CFG["theme"],
                 "conns": CFG["connections"], "mode": CFG.get("speed_mode", "auto"), "show_progress": CFG["show_progress"],
                 "task": pd.get("task"), "cats": [{"name": n, "folder": category_folder(n)} for n in CFG["categories"]],
                 "default_dir": DEFAULT_DIR}
+        kn = pd.get("known") or {}
+        if kn.get("name"):                       # name (and maybe size) already known from the browser: show at once
+            nm = safe_name(kn["name"])
+            cat = categorize(pd["url"], nm)
+            folder = category_folder(cat)
+            d.update({"name": nm, "size": kn.get("size"), "mime": kn.get("mime", ""),
+                      "category": cat, "folder": folder, "path": os.path.join(folder, nm)})
+        return d
     elif op == "popup_probe":
         G.last_popup = time.time()
         pd = G.pending.get(b.get("pid"))
@@ -8669,10 +8681,11 @@ $('#path').oninput=e=>{S.path=e.target.value;$('#nm').value=base(S.path);setTitl
 $('#cats').onclick=e=>{const b=e.target.closest('[data-c]');if(b)setCat(b.dataset.c,true)};$('#cn').onchange=e=>S.conn=e.target.value;$('#af').onchange=e=>S.after=e.target.value;
 const dc=[4,8,16,32].includes(I.conns)?String(I.conns):'32';$('#cn').value=dc;S.conn=dc;
 $('#nm').oninput=e=>{S.path=join(dir(S.path),e.target.value);$('#path').value=S.path};
+if(I.name){S.name=I.name;S.cat=I.category;S.path=I.path;S.size=I.size;$('#nm').disabled=false;$('#nm').value=I.name;$('#path').value=I.path;$('#fi').innerHTML=ico(ext(I.name));setCat(I.category,false);secure(I.ssl);setTitle(I.name);$('#meta').innerHTML=`<span>${L('size')}: <b>${fs(I.size)}</b></span><span>${L('src')}: <b>${esc(I.host)}</b></span>`;$('#go').disabled=$('#lt').disabled=false}
 $('#go').onclick=()=>begin(false);$('#lt').onclick=()=>begin(true)}
 function setCat(c,move){S.cat=c;document.querySelectorAll('.chip').forEach(x=>x.classList.toggle('on',x.dataset.c==c));if(move){const f=I.cats.find(x=>x.name==c);if(f){S.path=join(f.folder,base(S.path));$('#path').value=S.path}}}
 async function changeDir(){const r=await api('pick_folder',{start:dir(S.path)||I.default_dir});if(r.path){S.path=join(r.path,base(S.path));$('#path').value=S.path}else if(r.err){const v=prompt(L('chg'),dir(S.path));if(v){S.path=join(v,base(S.path));$('#path').value=S.path}}}
-function fillInfo(r){S.path=r.path;S.cat=r.category;S.name=r.name;$('#nm').disabled=false;$('#nm').value=r.name;$('#path').value=r.path;$('#fi').innerHTML=ico(ext(r.name));setCat(r.category,false);secure(r.ssl);setTitle(r.name);
+function fillInfo(r){if(!document.querySelector('#nm'))return;S.path=r.path;S.cat=r.category;S.name=r.name;$('#nm').disabled=false;$('#nm').value=r.name;$('#path').value=r.path;$('#fi').innerHTML=ico(ext(r.name));setCat(r.category,false);secure(r.ssl);setTitle(r.name);
 $('#meta').innerHTML=`<span>${L('size')}: <b>${fs(r.size)}</b></span><span>${L('src')}: <b>${esc(r.host)}</b></span><span class="${r.resume?'ok':'no'}">${L(r.resume?'resume':'nores')}${r.resume?'<i></i>':''}</span>`+(r.err?`<div class="errb" style="flex-basis:100%">${esc(L('nofo'))} ${esc(r.err)}</div>`:'');$('#go').disabled=$('#lt').disabled=false}
 async function begin(later){const g=$('#go'),l=$('#lt');g.disabled=l.disabled=true;const r=await api('popup_start',{pid:PID,path:S.path,category:S.cat,nconn:S.conn||'',after:S.after||'',later});if(r.err){$('#meta').insertAdjacentHTML('beforeend',`<div class="errb" style="flex-basis:100%">${esc(r.err)}</div>`);return}
 if(later){$('#view').innerHTML=`<section class="card"><div class="doneb">✔ ${L('added')}</div></section>`;setTimeout(closeWin,1200);return}
@@ -8699,7 +8712,7 @@ if(r.status=='Completed'){clearInterval(poll);$('#msg').innerHTML=`<div class="d
 (async()=>{I=await api('popup_info',{pid:PID});if(I.err){document.body.innerHTML='<p style="padding:30px">'+esc(I.err)+'</p>';return}
 lang=I.lang=='ar'?'ar':'en';document.documentElement.lang=lang;document.documentElement.dir='ltr';secure(I.ssl);setTitle(I.host);
 if(I.task){tid=I.task;progView();return}
-preView();const r=await api('popup_probe',{pid:PID});if(r.err&&!r.name){$('#meta').innerHTML=`<div class="errb">${esc(r.err)}</div>`;return}S.size=r.size;fillInfo(r)})();
+preView();const r=await api('popup_probe',{pid:PID});if(!$('#nm'))return;if(r.err&&!r.name){$('#meta').innerHTML=`<div class="errb">${esc(r.err)}</div>`;return}S.size=r.size;fillInfo(r)})();
 </script></body></html>
 
 '''
@@ -9138,6 +9151,7 @@ const rows=[[L('Browser'),b.installed?pl('b','Detected'):pl('n','Not found')],[L
 [L('Native host'),b.win?(b.host_registered?pl('g','Registered'):pl('n','Not registered')):pl('n','Windows only')]];
 let hint='';if(!b.installed)hint=`<div class="hint w">${L('Browser not found on this computer.')}</div>`;else if(con)hint=`<div class="hint">${L(b.via=='native'?'Native Messaging':'Local connection')}${b.ext_version?' · v'+esc(b.ext_version):''} · ${L('Last seen')} ${age}s</div>`;
 else if(ins)hint=`<div class="hint">${L('The extension is not connected yet. Open the browser first.')}</div>`;
+if(con&&b.ext_version&&b.ext_latest&&b.ext_version!==b.ext_latest)hint+=`<div class="hint w">${lang=='ar'?`الإضافة قديمة (v${esc(b.ext_version)}) — الأحدث v${esc(b.ext_latest)}. اضغط زر ↻ في brave://extensions لإعادة تحميلها.`:`Extension is old (v${esc(b.ext_version)}) — latest is v${esc(b.ext_latest)}. Click the ↻ reload button on brave://extensions.`}</div>`;
 const main=!ins?`<button class="pill pri" data-bi="setup|${b.id}">${ic('dl',18)}${L('Install extension')}</button>`:!con?`<button class="pill pri" data-bi="recon|${b.id}">${ic('refresh',18)}${L('Reconnect')}</button>`:`<button class="pill pri" data-bi="test|${b.id}">${ic('check',18)}${L('Test connection')}</button>`;
 const lc=b.last_cap?`<div class="hint" style="direction:ltr;text-align:start">${L('Last capture')}: ${esc(b.last_cap)}</div>`:'';
 return`<div class="bcard ${con?'ok':''}"><div class="bh"><div class="bic">${BRI[b.id]||''}</div><div><div class="bn">${esc(b.title)}</div><small>${esc(b.family=='firefox'?'Gecko':'Chromium')}</small></div><div style="margin-inline-start:auto">${con?pl('g','Connected'):pl('r','Disconnected')}</div></div><div class="bst">${rows.map(r=>`<div class="sr"><span>${r[0]}</span>${r[1]}</div>`).join('')}</div>${hint}${lc}<div class="bact">${main}${ins?`<button class="pill" data-bi="setup|${b.id}">${L('Setup guide')}</button>`:''}<button class="pill sm" data-bi="manage|${b.id}" ${b.installed?'':'disabled'}>${L('Manage')}</button><button class="pill sm" data-bi="launch|${b.id}" ${b.installed?'':'disabled'}>${L('Open browser')}</button>${b.prepared?`<button class="pill sm" data-bi="folder|${b.id}">${L('Open folder')}</button>`:''}</div></div>`}
