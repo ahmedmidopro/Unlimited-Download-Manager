@@ -52,7 +52,7 @@ ALL_COLS = [("name", "File name", 260), ("size", "Size", 80), ("done", "Download
 DEFAULT_CFG = {
     "language": "en", "theme": "dark", "palette": "default", "text_size": 100,
     "max_parallel": 0, "dup_action": "ask", "server_date": True, "open_after": False, "limit_saved": 500,
-    "connections": 32, "timeout": 30, "retries": 6, "queue_parallel": 1,
+    "connections": 32, "conn_preset": "high", "timeout": 30, "retries": 6, "queue_parallel": 1,
     "speed_mode": "auto",            # auto = adaptive number of connections, manual = fixed number
     "host_max_conn": 32,             # safety: max simultaneous connections UDM opens to one website (0 = no limit)
     "write_buffer_kb": 1024,         # disk write buffer per connection
@@ -70,7 +70,8 @@ DEFAULT_CFG = {
                      "mp3 wav flac aac m4a mp4 mkv avi mov wmv flv webm mpg mpeg",
     "excluded_types": "", "excluded_sites": "", "url_exceptions": "", "capture_enabled": True,
     "silent": False, "show_progress": True, "minimized_progress": False, "notify": True,
-    "sounds": True, "sound_done": "", "sound_error": "", "confirm_delete": True,
+    "sounds": True, "sound_done": "", "sound_error": "", "sound_qstart": "", "sound_qstop": "", "confirm_delete": True,
+    "confirm_stop": True, "show_complete": False, "cat_folder_follow": False,
     "startup": False, "tray": True, "remember_dir": True,
     "auto_update_check": True, "last_update_check": 0,
     "av_enabled": False, "av_command": "", "av_args": '"{file}"',
@@ -184,6 +185,9 @@ def load_cfg():
     if CFG.get("cfg_v", 1) < 4:                      # tray must stay on: closing keeps UDM running
         CFG["tray"] = True
         CFG["cfg_v"] = 4
+    if CFG.get("cfg_v", 1) < 5:                      # IDM-style settings: derive the connection preset from the current connections
+        CFG["conn_preset"] = {32: "high", 16: "medium", 8: "low", 4: "mobile"}.get(CFG.get("connections"), "custom")
+        CFG["cfg_v"] = 5
     save_cfg()
 
 
@@ -391,13 +395,15 @@ def file_hash(path, algo="sha256"):
 def play_sound(kind):
     if not CFG["sounds"]:
         return
-    path = CFG.get("sound_done" if kind == "done" else "sound_error", "")
+    key = {"done": "sound_done", "error": "sound_error",
+           "qstart": "sound_qstart", "qstop": "sound_qstop"}.get(kind, "sound_error")
+    path = CFG.get(key, "")
     try:
         if winsound:
             if path and os.path.exists(path):
                 winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
             else:
-                winsound.MessageBeep(winsound.MB_OK if kind == "done" else winsound.MB_ICONHAND)
+                winsound.MessageBeep(winsound.MB_OK if kind != "error" else winsound.MB_ICONHAND)
     except Exception:
         pass
 
@@ -1246,7 +1252,14 @@ class Task:
                 if stop.is_set():
                     return
                 fails = 1 if ws.got else fails + 1                   # progress during the attempt resets the counter
-                if fails > (2 if getattr(e, "fatal", False) else CFG["retries"]):
+                limit = CFG["retries"]
+                try:
+                    qr = G.mgr.queues.get(self.queue or {}).get("retries") if getattr(G, "mgr", None) else 0
+                    if qr:
+                        limit = qr
+                except Exception:
+                    pass
+                if fails > (2 if getattr(e, "fatal", False) else limit):
                     self.failed, self.error = True, str(e)
                     stop.set()
                     return
@@ -1585,7 +1598,8 @@ DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 def new_queue(name):
     return {"name": name, "start": "", "stop": "", "days": list(range(7)), "parallel": 1,
-            "shutdown": False, "exit": False, "active": False, "after": "none", "date": "", "folder": ""}
+            "shutdown": False, "exit": False, "active": False, "after": "none", "date": "", "folder": "",
+            "open_after": "", "start_on_startup": False, "retries": 0}
 
 
 class Manager:
@@ -1717,6 +1731,7 @@ class Manager:
             if t.queue == name and t.status in ("Paused", "Error", "Queued"):
                 t.status = "Queued"
         q["active"] = True
+        play_sound("qstart")
 
     def stop_queue(self, name):
         q = self.queues.get(name)
@@ -1725,6 +1740,7 @@ class Manager:
         for t in list(self.tasks.values()):
             if t.queue == name:
                 t.pause()
+        play_sound("qstop")
 
     def tick(self):
         now = datetime.datetime.now()
@@ -1773,6 +1789,8 @@ class Manager:
                 act = q.get("after") or ("shutdown" if q.get("shutdown") else "exit" if q.get("exit") else "none")
                 if act != "none":
                     self.events.put(("after", act))
+                if q.get("open_after") and os.path.exists(q["open_after"]):
+                    open_path(q["open_after"])
         # grabbers
         for g in list(self.grabbers.values()):
             due = False
@@ -3348,7 +3366,8 @@ def ui_state():
     queues = [dict(q, count=sum(1 for t in m.tasks.values() if t.queue == q["name"])) for q in m.queues.values()]
     return {"tasks": rows, "queues": queues, "cats": list(CFG["categories"]), "speed": sum(t.speed for t in act),
             "active": len(act), "disk": disk, "events": ev, "incoming": inc, "silent": CFG["silent"],
-            "notify": CFG["notify"], "confirm": CFG["confirm_delete"], "connections": CFG["connections"],
+            "notify": CFG["notify"], "confirm": CFG["confirm_delete"], "confirm_stop": CFG["confirm_stop"],
+            "show_complete": CFG["show_complete"], "connections": CFG["connections"],
             "theme": CFG["theme"], "language": CFG["language"], "vcount": len(G.videos),
             "palette": CFG["palette"], "text_size": CFG["text_size"], "limit": CFG["speed_limit_kb"], "limit_saved": CFG["limit_saved"],
             "ext": ext_summary(), "capture": CFG["capture_enabled"], "mode": CFG["speed_mode"], "ver": APP_VER,
@@ -3472,6 +3491,9 @@ def ui_act(b):
         if b.get("folder") and cat != "Auto" and CFG["remember_dir"]:
             CFG["last_dir"][cat] = b["folder"]
             save_cfg()
+        if b.get("folder") and cat != "Auto" and CFG.get("cat_folder_follow") and cat in CFG["categories"]:
+            CFG["categories"][cat]["folder"] = b["folder"]
+            save_cfg()
         return {"n": done}
     if op == "resume":
         for t in ts:
@@ -3559,6 +3581,9 @@ def ui_act(b):
         q["days"], q["folder"] = b.get("days", list(range(7))), (b.get("folder") or "").strip()
         q["after"] = b.get("after") if b.get("after") in ("none", "exit", "sleep", "hibernate", "shutdown") else "none"
         q["shutdown"], q["exit"] = q["after"] == "shutdown", q["after"] == "exit"
+        q["open_after"] = (b.get("open_after") or "").strip()
+        q["start_on_startup"] = bool(b.get("start_on_startup"))
+        q["retries"] = max(0, min(100, int(b.get("retries") or 0)))
         q["date"] = b.get("date", "").strip() if re.match(r"^\d{4}-\d{2}-\d{2}$", b.get("date", "").strip()) else ""
         m.save()
     elif op == "qnew" and b.get("name") and b["name"] not in m.queues:
@@ -4144,6 +4169,10 @@ def main():
         return
     G.mgr = Manager()
     G.mgr.load()
+    for q in G.mgr.queues.values():                  # queues set to start with the program (IDM scheduler)
+        if q.get("start_on_startup") and any(t.queue == q["name"] and t.status in ("Paused", "Error", "Queued")
+                                             for t in G.mgr.tasks.values()):
+            G.mgr.start_queue(q["name"])
     G.build_no = _build_number()
     threading.Thread(target=startup_integration, daemon=True).start()
     threading.Thread(target=engine_loop, daemon=True).start()
@@ -8763,7 +8792,7 @@ const AR={'Unlimited Download Manager':'مدير التحميل غير المح�
 'QS':'انسخ أي رابط وستظهر نافذة الإضافة تلقائياً.<br>اسحب الروابط أو الملفات النصية وأفلتها داخل النافذة.<br>استخدم «حمّل لاحقاً» مع الجدولة للتحميل في وقت محدد.<br>القائمة الجانبية ← ربط المتصفح لتوصيل Chrome / Brave / Edge / Firefox.','EXT':'تم إنشاء الإضافة في:','EXT2':'Chrome/Edge ← الإضافات ← وضع المطوّر ← Load unpacked','ABOUT':'مدير التحميل المتكامل','ZIP Preview':'معاينة ZIP','Delete':'حذف','Queue name:':'اسم القائمة:','Video Downloader':'تحميل الفيديو','Video Downloader…':'تحميل الفيديو…','Analyze':'تحليل','Analyzing…':'جاري التحليل…','Detected in browser':'تم اكتشافه في المتصفح','Clear list':'مسح القائمة','No videos detected yet':'لم يتم اكتشاف فيديوهات بعد — شغّل فيديو في المتصفح (مع إضافة UDM)','Direct download':'تحميل مباشر','Quality':'الجودة','Format':'الصيغة','Audio only':'صوت فقط','Download':'تحميل','Estimated size':'الحجم التقديري','Best':'الأفضل','Update yt-dlp':'تحديث yt-dlp','Updating…':'جاري التحديث…','Video download started':'بدأ تحميل الفيديو','Video':'فيديو','Browser Integration':'ربط المتصفح','Browser Integration…':'ربط المتصفح…','Choose your browser':'اختر المتصفح','installed':'مثبّت','not found':'غير موجود','Open the extensions page':'افتح صفحة الإضافات','Open extension folder':'افتح مجلد الإضافة','Copy folder path':'نسخ مسار المجلد','Check Connection':'تحقق من الاتصال','Back':'رجوع','Waiting for the extension…':'بانتظار الإضافة…','Connected successfully':'تم الربط بنجاح','The extension is ready.':'الإضافة جاهزة.','Native host registered':'تم تسجيل الـ Host','Extension files prepared':'تم تجهيز ملفات الإضافة','Extension detected':'تم اكتشاف الإضافة','Connection type':'نوع الاتصال','Native Messaging':'Native Messaging','Local connection (fallback)':'اتصال محلي (احتياطي)','Install the signed add-on':'ثبّت الإضافة الموقّعة','Not connected yet':'لم يتم الاتصال بعد','Test link':'اختبار الرابط','Resume capability':'دعم الاستكمال','Duplicate download link':'الرابط موجود بالفعل في القائمة','Skip':'تخطَّ','Add it with a numbered file name':'أضفه باسم ملف مرقّم','Add it and replace the old download':'أضفه واستبدل التحميل القديم','Speed limit for this download KB/s (0 = none)':'حد السرعة لهذا التحميل كيلوبايت/ث (0 = بلا حد)','Checksum MD5 / SHA-1 / SHA-256 (optional)':'بصمة الملف MD5 / SHA-1 / SHA-256 (اختياري)','Import list…':'استيراد قائمة…','Export list…':'تصدير قائمة…','Export selected':'تصدير المحدد','Copy folder path':'نسخ مسار المجلد','Refresh download address…':'تحديث عنوان التحميل…','Or paste the new address here:':'الصق العنوان الجديد هنا:','Redownload':'إعادة التحميل','Check file (SHA-256)':'فحص الملف (SHA-256)','Limiter: On':'المحدِّد: يعمل','Limiter: Off':'المحدِّد: متوقف','Maximum download speed (KB/s)':'أقصى سرعة تحميل (كيلوبايت/ث)','Once on date (YYYY-MM-DD, empty = every selected day)':'مرة واحدة في تاريخ (YYYY-MM-DD، فارغ = كل الأيام المحددة)','Save all files of this queue to':'احفظ كل ملفات هذه القائمة في','When the queue is done':'عند انتهاء القائمة','Downloads at the same time (0 = no limit)':'تحميلات في نفس الوقت (0 = بلا حد)','If a duplicate link is added':'إذا أُضيف رابط مكرر','Give finished files the date from the server':'اعطِ الملفات المكتملة تاريخ السيرفر','Open each file when it has finished downloading':'افتح كل ملف عند اكتمال تحميله','Color palette':'لوحة الألوان','Text size (%)':'حجم النص (%)','Don\'t go to parent folders':'لا تصعد للمجلدات الأعلى','Download a playlist':'تحميل قائمة تشغيل','Getting the list…':'جاري جلب القائمة…','Check all':'تحديد الكل','Uncheck all':'إلغاء التحديد','Download checked':'حمّل المحدد','Subtitles too':'مع الترجمة','Exact cut':'قص دقيق','From':'من','To':'إلى','default':'افتراضي','ocean':'أزرق المحيط','forest':'أخضر الغابة','purple':'بنفسجي منتصف الليل','rose':'وردي','sunset':'غروب','teal':'فيروزي','neon':'نيون','clay':'طيني','ask':'اسألني','replace':'استبدل','number':'رقّمه','skip':'تخطَّ','exit':'إغلاق البرنامج','sleep':'سكون','hibernate':'إسبات','shutdown':'إيقاف التشغيل'};
 
 const EN={QS:'Copy a link and the Add dialog appears automatically.<br>Drag &amp; drop links or text files into the window.<br>Use “Download Later” + Scheduler for timed downloads.<br>Browser Integration (left menu) to connect Chrome / Brave / Edge / Firefox.',EXT:'Extension created in:',EXT2:'Chrome/Edge → Extensions → Developer mode → Load unpacked',ABOUT:'Unlimited Download Manager'};
-const DISP={exit:'Exit the program',sleep:'Sleep',hibernate:'Hibernate',shutdown:'Shut down',default:'Default',ocean:'Ocean blue',forest:'Forest green',purple:'Midnight purple',rose:'Rose',sunset:'Sunset',teal:'Teal night',neon:'Cyber neon',clay:'Soft clay',ask:'Ask me',replace:'Replace the old one',number:'Number the file',skip:'Skip it',en:'English',ar:'العربية',dark:'Dark',light:'Light',none:'None',system:'System',manual:'Manual',hour:'Hour',day:'Day'};
+const DISP={exit:'Exit the program',sleep:'Sleep',hibernate:'Hibernate',shutdown:'Shut down',default:'Default',ocean:'Ocean blue',forest:'Forest green',purple:'Midnight purple',rose:'Rose',sunset:'Sunset',teal:'Teal night',neon:'Cyber neon',clay:'Soft clay',ask:'Ask me',replace:'Replace the old one',number:'Number the file',skip:'Skip it',high:'High speed',medium:'Medium',low:'Low speed',mobile:'Mobile',custom:'Custom',en:'English',ar:'العربية',dark:'Dark',light:'Light',none:'None',system:'System',manual:'Manual',hour:'Hour',day:'Day'};
 
 let theme='dark',lang='en',pal='default',tsz=100;
 
@@ -8788,17 +8817,18 @@ function form(fields,v0={}){const w=document.createElement('div');fields.forEach
 function addDlg(pre={}){const f=form([['urls','Links — one per line (pattern: file[01-10].zip)','area',4],['category','Category (optional)','sel',['Uncategorized','Auto',...S.cats.filter(c=>c!='Uncategorized')]],['folder','Save to (empty = automatic)','text'],['nconn','Connections','num'],['description','Description','text'],['queue','Queue (for Download Later)','sel',S.queues.map(q=>q.name)],['referer','Referer','text'],['cookies','Cookies','text'],['user','Username','text'],['pwd','Password','pass'],['speed_limit_kb','Speed limit for this download KB/s (0 = none)','num'],['expect_hash','Checksum MD5 / SHA-1 / SHA-256 (optional)','text']],{urls:(pre.urls||[]).join('\n'),nconn:S.connections,referer:pre.referer||'',cookies:pre.cookies||'',category:'Uncategorized'});
 const go=now=>async()=>{const v=f.get();if(!/(https?|ftp):\/\//i.test(v.urls)){toast(L('Enter a valid link'));return false}await addCall({...v,start:now,queue:now?'':v.queue})};
 const o=modal('Add URL',f,[{t:'Cancel'},{t:'Test link',fn:async()=>{const u=($('[name=urls]',f).value.match(/(?:https?|ftp):\/\/\S+/)||[])[0];if(!u)return false;const r=await api('probe',{url:u,referer:$('[name=referer]',f).value,cookies:$('[name=cookies]',f).value});toast(r.err?esc(r.err):`${esc(r.name)}<br>${fs(r.size)} · ${L('Resume capability')}: ${r.resume?'✓':'✗'}`,9000);return false}},{t:'Download Later',fn:go(0)},{t:'Download Now',p:1,fn:go(1)}]),ta=$('[name=urls]',f),chk=()=>{const v=ta.value.trim();if(v&&!/\s/.test(v)&&isVid(v)){o.remove();videoDlg(v,pre)}};ta.addEventListener('paste',()=>setTimeout(chk,60));ta.addEventListener('change',chk)}
-const OPT=[['General',[['language','Language','sel',['en','ar']],['theme','Theme','sel',['dark','light']],['palette','Color palette','sel',['default','ocean','forest','purple','rose','sunset','teal','neon','clay']],['text_size','Text size (%)','num'],['clipboard_monitor','Monitor clipboard for links','chk'],['capture_enabled','Capture downloads from the browser extension','chk'],['silent','Silent mode (add without asking)','chk'],['notify','Completion notification','chk'],['sounds','Sounds','chk'],['startup','Start with Windows','chk'],['tray','Keep running in tray when window closes','chk'],['confirm_delete','Ask before deleting','chk'],['dup_action','If a duplicate link is added','sel',['ask','replace','number','skip']],['server_date','Give finished files the date from the server','chk'],['open_after','Open each file when it has finished downloading','chk']]],
-['Connection',[['speed_mode','Speed mode','sel',['auto','manual']],['connections','Connections per download: maximum in Auto mode, fixed number in Manual (1-32)','num'],['host_max_conn','Max connections per website (0 = no limit)','num'],['write_buffer_kb','Disk write buffer per connection (KB)','num'],['keepalive','Reuse connections (Keep-Alive)','chk'],['max_parallel','Downloads at the same time (0 = no limit)','num'],['timeout','Timeout (seconds)','num'],['retries','Retries after error','num'],['speed_limit_kb','Speed limit KB/s (0 = unlimited)','num'],['quota_mb','Quota MB (0 = off)','num'],['quota_period','Quota period','sel',['hour','day']],['user_agent','User-Agent','text'],['ftp_passive','FTP passive mode','chk'],['ignore_mtime','Ignore modification-time changes on resume','chk'],['server_limits','Per-server limits — one per line: *.site.com=4','area']]],
+const OPT=[['General',[['language','Language','sel',['en','ar']],['theme','Theme','sel',['dark','light']],['palette','Color palette','sel',['default','ocean','forest','purple','rose','sunset','teal','neon','clay']],['text_size','Text size (%)','num'],['clipboard_monitor','Monitor clipboard for links','chk'],['capture_enabled','Capture downloads from the browser extension','chk'],['silent','Silent mode (add without asking)','chk'],['notify','Completion notification','chk'],['confirm_stop','Warn before stopping a download','chk'],['show_complete','Show a dialog when a download completes','chk'],['startup','Start with Windows','chk'],['tray','Keep running in tray when window closes','chk'],['confirm_delete','Ask before deleting','chk'],['dup_action','If a duplicate link is added','sel',['ask','replace','number','skip']],['server_date','Give finished files the date from the server','chk'],['open_after','Open each file when it has finished downloading','chk']]],
+['Connection',[['conn_preset','Connection type','sel',['high','medium','low','mobile','custom']],['speed_mode','Speed mode','sel',['auto','manual']],['connections','Connections per download: maximum in Auto mode, fixed number in Manual (1-32)','num'],['host_max_conn','Max connections per website (0 = no limit)','num'],['write_buffer_kb','Disk write buffer per connection (KB)','num'],['keepalive','Reuse connections (Keep-Alive)','chk'],['max_parallel','Downloads at the same time (0 = no limit)','num'],['timeout','Timeout (seconds)','num'],['retries','Retries after error','num'],['speed_limit_kb','Speed limit KB/s (0 = unlimited)','num'],['quota_mb','Quota MB (0 = off)','num'],['quota_period','Quota period','sel',['hour','day']],['user_agent','User-Agent','text'],['ftp_passive','FTP passive mode','chk'],['ignore_mtime','Ignore modification-time changes on resume','chk'],['server_limits','Per-server limits — one per line: *.site.com=4','area']]],
 ['Proxy',[['proxy_mode','Mode','sel',['none','system','manual']],['proxy_http','HTTP proxy host:port','text'],['proxy_https','HTTPS proxy host:port','text'],['proxy_ftp','FTP proxy host:port','text'],['proxy_user','Username','text'],['proxy_pass','Password','pass'],['proxy_exclude','No proxy for (;)','text']]],
 ['Types & sites',[['capture_types','Captured file types','area',3],['excluded_types','Excluded file types','area',2],['excluded_sites','Excluded sites (wildcards)','area',2],['url_exceptions','URL exceptions (wildcards)','area',2]]],
-['Save to',[['temp_dir','Temporary folder (empty = next to file)','text'],['remember_dir','Remember last folder per category','chk'],['cats_text','Categories — one per line: Name | extensions | folder','area',6],['logins_text','Logins — one per line: site | user | password (encrypted when saved)','area',3]]],
-['Antivirus',[['av_enabled','Scan files after download','chk'],['av_command','Antivirus program','text'],['av_args','Arguments ({file} = downloaded file)','text']]]];
+['Save to',[['temp_dir','Temporary folder (empty = next to file)','text'],['remember_dir','Remember last folder per category','chk'],['cat_folder_follow','Change the category folder when I pick a different folder','chk'],['cats_text','Categories — one per line: Name | extensions | folder','area',6],['logins_text','Logins — one per line: site | user | password (encrypted when saved)','area',3]]],
+['Antivirus',[['av_enabled','Scan files after download','chk'],['av_command','Antivirus program','text'],['av_args','Arguments ({file} = downloaded file)','text']]],
+['Sounds',[['sounds','Play sounds','chk'],['sound_done','Sound: download complete (file, empty = default beep)','text'],['sound_error','Sound: download failed','text'],['sound_qstart','Sound: queue started','text'],['sound_qstop','Sound: queue finished','text']]]];
 async function optDlg(){const c=await api('cfg_get'),w=document.createElement('div'),tabs=document.createElement('div'),fm=OPT.map(([n,fl])=>form(fl,c));tabs.className='tabs';
-const show=i=>{$$('span',tabs).forEach((s,j)=>s.className=i==j?'on':'');fm.forEach((f,j)=>f.style.display=i==j?'':'none')};OPT.forEach(([n],i)=>{const s=document.createElement('span');s.textContent=n;s.onclick=()=>show(i);tabs.append(s)});w.append(tabs,...fm);show(0);
+const show=i=>{$$('span',tabs).forEach((s,j)=>s.className=i==j?'on':'');fm.forEach((f,j)=>f.style.display=i==j?'':'none')};OPT.forEach(([n],i)=>{const s=document.createElement('span');s.textContent=n;s.onclick=()=>show(i);tabs.append(s)});w.append(tabs,...fm);show(0);const ps=$('[name=conn_preset]',fm[1]),cn=$('[name=connections]',fm[1]);if(ps&&cn){const PM={high:32,medium:16,low:8,mobile:4};ps.onchange=()=>{if(PM[ps.value])cn.value=PM[ps.value]};cn.onchange=()=>{ps.value='custom'}}
 modal('Options',w,[{t:'Cancel'},{t:'Save',p:1,fn:async()=>{const cfg=Object.assign({},...fm.map(f=>f.get()));await api('cfg_set',{cfg});toast(L('Saved'));poll()}}],1)}
 function schedDlg(name){name=name||S.queues[0].name;const q=S.queues.find(x=>x.name==name),D=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'],v={...q};D.forEach((d,i)=>v['d'+i]=q.days.includes(i));v.after=q.after||(q.shutdown?'shutdown':q.exit?'exit':'none');
-const f=form([['name','Queue','sel',S.queues.map(x=>x.name)],['start','Start time (HH:MM, empty = manual)','text'],['stop','Stop time (HH:MM)','text'],['parallel','Max parallel downloads','num'],...D.map((d,i)=>['d'+i,d,'chk']),['date','Once on date (YYYY-MM-DD, empty = every selected day)','text'],['folder','Save all files of this queue to','text'],['after','When the queue is done','sel',['none','exit','sleep','hibernate','shutdown']]],v);
+const f=form([['name','Queue','sel',S.queues.map(x=>x.name)],['start','Start time (HH:MM, empty = manual)','text'],['stop','Stop time (HH:MM)','text'],['parallel','Max parallel downloads','num'],...D.map((d,i)=>['d'+i,d,'chk']),['date','Once on date (YYYY-MM-DD, empty = every selected day)','text'],['folder','Save all files of this queue to','text'],['after','When the queue is done','sel',['none','exit','sleep','hibernate','shutdown']],['open_after','Open this file when the queue is done','text'],['start_on_startup','Start this queue on program startup','chk'],['retries','Retries per file (0 = use the global setting)','num']],v);
 $('select',f).onchange=e=>{$('.ov').remove();schedDlg(e.target.value)};
 const save=async()=>{const x=f.get();x.days=D.map((d,i)=>x['d'+i]?i:-1).filter(i=>i>=0);await api('qsave',x);poll()};
 modal('Scheduler',f,[{t:'Close'},{t:'Stop Queue',fn:async()=>{await api('qstop',{name});poll()}},{t:'Start Queue',fn:async()=>{await save();await api('qstart',{name});poll()}},{t:'Save',p:1,fn:save}])}
@@ -8895,7 +8925,7 @@ drawDet();tools();const iv=setInterval(()=>{if(!document.body.contains(w))clearI
 if(u0)analyze(u0,ctx.referer||'',ctx.cookies||'')}
 
 
-const A={resume:()=>api('resume',{ids:sel()}),stop:()=>api('stop',{ids:sel()}),stopall:()=>api('stopall'),
+const A={resume:()=>api('resume',{ids:sel()}),stop:()=>{if(S.confirm_stop&&!confirm(L('Stop the selected downloads?')))return;api('stop',{ids:sel()})},stopall:()=>api('stopall'),
 del:async()=>{const ids=sel();if(!ids.length)return;let files=false;if(S.confirm){const o=modal('Delete',Object.assign(document.createElement('div'),{innerHTML:`Remove ${ids.length} download(s) from the list?<label class="chk"><input type="checkbox" id="dfiles"><span>Also delete the files from disk</span></label>`}),[{t:'Cancel'},{t:'Delete',p:1,fn:async()=>{await api('delete',{ids,files:$('#dfiles').checked});st.sel.clear();poll()}}]);return}await api('delete',{ids,files});st.sel.clear();poll()},
 share:()=>{const u=sel().map(i=>S.tasks.find(t=>t.id==i)?.url).filter(Boolean).join('\n');if(u){navigator.clipboard?.writeText(u);toast(L('Link(s) copied'))}}};
 
@@ -8903,7 +8933,7 @@ function ctxMenu(e,items){$$('.ctx,.dd').forEach(x=>x.remove());const m=document
 document.addEventListener('mousedown',()=>pressed=1);document.addEventListener('mouseup',()=>setTimeout(()=>pressed=0,0));
 
 /* ===================== NEW DESIGN LAYER ===================== */
-Object.assign(AR,{'Last capture':'آخر التقاط','Download with UDM':'تحميل بواسطة UDM','Home':'الرئيسية','Completed':'المكتملة','Settings':'الإعدادات','Pause All':'إيقاف الكل','Resume All':'استئناف الكل','Clear List':'مسح القائمة','Recommended':'موصى به','remaining':'متبقي',
+Object.assign(AR,{'Last capture':'آخر التقاط','Download with UDM':'تحميل بواسطة UDM','Home':'الرئيسية','Completed':'المكتملة','Settings':'الإعدادات','Connection type':'نوع الاتصال','Warn before stopping a download':'حذّرني قبل إيقاف تحميل','Show a dialog when a download completes':'أظهر نافذة عند اكتمال تحميل','Change the category folder when I pick a different folder':'غيّر مجلد التصنيف عندما أختار مجلداً مختلفاً','Play sounds':'تشغيل الأصوات','Sound: download complete (file, empty = default beep)':'صوت: اكتمال التحميل (ملف، فارغ = الصوت الافتراضي)','Sound: download failed':'صوت: فشل التحميل','Sound: queue started':'صوت: بدء القائمة','Sound: queue finished':'صوت: انتهاء القائمة','high':'سرعة عالية','medium':'متوسطة','low':'بطيئة','mobile':'جوال','custom':'مخصص','Stop this download?':'إيقاف هذا التحميل؟','Stop the selected downloads?':'إيقاف التحميلات المحددة؟','Open this file when the queue is done':'افتح هذا الملف عند انتهاء القائمة','Start this queue on program startup':'شغّل هذه القائمة عند بدء البرنامج','Retries per file (0 = use the global setting)':'عدد المحاولات لكل ملف (0 = استخدم الإعداد العام)','Pause All':'إيقاف الكل','Resume All':'استئناف الكل','Clear List':'مسح القائمة','Recommended':'موصى به','remaining':'متبقي',
 'Connected':'متصل','Disconnected':'غير متصل','Not set up':'غير مُعدّ','Installed':'مثبّتة','Not Installed':'غير مثبّتة','Disabled in browser':'معطّلة في المتصفح','Detected':'موجود','Not found':'غير موجود',
 'Extension':'الإضافة','Browser':'المتصفح','Native host':'Native Host','Registered':'مسجّل','Not registered':'غير مسجّل','Last seen':'آخر اتصال','ago':'منذ','Install extension':'تثبيت الإضافة','Reconnect':'إعادة الاتصال',
 'Test connection':'اختبار الاتصال','Setup guide':'دليل الإعداد','Manage':'إدارة','Open browser':'فتح المتصفح','Open folder':'فتح المجلد','Refresh':'تحديث','Capture downloads':'التقاط التحميلات',
@@ -9020,7 +9050,7 @@ case'lang':{const l=lang=='ar'?'en':'ar';applyLang(l);api('cfg_set',{cfg:{langua
 case'chev':return menuAt($('.urlbar'),[['Advanced add (options)…',()=>addDlg({urls:[$('#url').value].filter(Boolean)}),'link'],['Video Downloader…',()=>videoDlg($('#url').value.trim()),'video'],['Paste from clipboard',async()=>{try{$('#url').value=(await navigator.clipboard.readText()).trim()}catch(_){}},'copy'],['Import list…',importList,'tray']]);
 case'more':return toolsMenu(el);case'pauseall':return api('stopall').then(poll);case'resumeall':return api('resume',{ids:S.tasks.filter(t=>t.status!='Completed').map(t=>t.id)}).then(poll);case'clear':return clearList();
 case'cap':{const on=!(BI?BI.capture:S.capture);if(BI)BI.capture=on;S.capture=on;api('cfg_set',{cfg:{capture_enabled:on}}).then(loadBI);renderBI();return}case'birefresh':return loadBI()}}
-function rowAct(x){const id=x.closest('.row').dataset.id,k=x.dataset.act;if(k=='stop')api('stop',{ids:[id]}).then(poll);else if(k=='resume')api('resume',{ids:[id]}).then(poll);else if(k=='folder')api('folder',{ids:[id]});else if(k=='del'){st.sel=new Set([id]);A.del()}}
+function rowAct(x){const id=x.closest('.row').dataset.id,k=x.dataset.act;if(k=='stop'){if(S.confirm_stop&&!confirm(L('Stop this download?')))return;api('stop',{ids:[id]}).then(poll)}else if(k=='resume')api('resume',{ids:[id]}).then(poll);else if(k=='folder')api('folder',{ids:[id]});else if(k=='del'){st.sel=new Set([id]);A.del()}}
 
 document.addEventListener('mousedown',()=>pressed=1);document.addEventListener('mouseup',()=>setTimeout(()=>pressed=0,0));
 document.addEventListener('click',e=>{pressed=0;const g=s=>e.target.closest(s);if(!g('.ctx')&&!g('.dd')&&!g('[data-menu]')&&!g('[data-a=chev]')&&!g('[data-a=bell]'))$$('.ctx,.dd').forEach(x=>x.remove());let x;
@@ -9042,7 +9072,7 @@ document.addEventListener('keydown',e=>{const inp=/INPUT|TEXTAREA|SELECT/.test(d
 async function poll(){try{const s=await(await fetch('/api/state',{headers:{'X-UDM-Token':T}})).json();S=s;if(s.theme&&s.theme!=theme)applyTheme(s.theme);if(s.language&&s.language!=lang)applyLang(s.language);if(s.palette&&s.palette!=pal)applyPal(s.palette);if(s.text_size&&s.text_size!=tsz)applyTS(s.text_size);
 st.sel.forEach(i=>{if(!S.tasks.some(t=>t.id==i))st.sel.delete(i)});render();updBar();
 for(const ev of s.events){if(ev.k=='done'||ev.k=='error'){NOTES.unshift({k:ev.k,id:ev.id,name:ev.name,msg:ev.msg||L('Download complete'),t:Date.now()});unread++;renderBell()}
-if(ev.k=='done'&&S.notify)toast(`✔ ${L('Download complete')}<br><b>${esc(ev.name)}</b><br><a href="#" style="color:#7fc0ff" onclick="api('open',{ids:['${ev.id}']});return false">${L('Open')}</a> · <a href="#" style="color:#7fc0ff" onclick="api('folder',{ids:['${ev.id}']});return false">${L('Open folder')}</a>`,9000);else if(ev.k=='error')toast('⚠ '+esc(ev.name)+'<br>'+esc(ev.msg),9000);else if(ev.k=='shutdown')toast('Queue finished — shutting down in 60 s. <a href="#" style="color:#7fc0ff" onclick="api(\'cancel_shutdown\');return false">Cancel</a>',60000)}
+if(ev.k=='done'&&S.show_complete){const _d=document.createElement('div');_d.innerHTML='<b>'+esc(ev.name)+'</b>';modal('Download complete',_d,[{t:'Open',fn:()=>api('open',{ids:[ev.id]})},{t:'Open folder',fn:()=>api('folder',{ids:[ev.id]})},{t:'Close',p:1}])}else if(ev.k=='done'&&S.notify)toast(`✔ ${L('Download complete')}<br><b>${esc(ev.name)}</b><br><a href="#" style="color:#7fc0ff" onclick="api('open',{ids:['${ev.id}']});return false">${L('Open')}</a> · <a href="#" style="color:#7fc0ff" onclick="api('folder',{ids:['${ev.id}']});return false">${L('Open folder')}</a>`,9000);else if(ev.k=='error')toast('⚠ '+esc(ev.name)+'<br>'+esc(ev.msg),9000);else if(ev.k=='shutdown')toast('Queue finished — shutting down in 60 s. <a href="#" style="color:#7fc0ff" onclick="api(\'cancel_shutdown\');return false">Cancel</a>',60000)}
 for(const p of s.incoming)onIncoming(p)}catch(e){}
 if(st.page=='browser'&&Date.now()-lastBI>2500){lastBI=Date.now();loadBI()}}
 function render(){renderNav();renderMain();renderBell()}
