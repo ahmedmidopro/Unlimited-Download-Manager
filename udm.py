@@ -3320,14 +3320,72 @@ def open_popup(url, referer="", cookies="", video=None, known=None):
     return pid
 
 
+_WARM = {"win": None, "busy": False, "pid": None, "lock": threading.Lock()}
+
+
+def _warm_popup_window():
+    """Pre-create one hidden popup window after startup, IDM-style: creating a WebView2
+    window costs ~a second, so pay it once here — showing the ready window is instant.
+    The window stays hidden until a download needs it; closing it only hides it again.
+    Title is empty on purpose: win_control() finds windows by title, and this window
+    must never be mistaken for the main window or a popup."""
+    try:
+        time.sleep(8)
+        if G.win is None or G.win_closed:
+            return
+        import webview
+        win = webview.create_window("", html="<html><body></body></html>", width=800, height=660, hidden=True)
+        win.events.closing += _on_warm_popup_closing
+        with _WARM["lock"]:
+            _WARM["win"] = win
+    except Exception:
+        pass
+
+
+def _on_warm_popup_closing(*args):
+    """The ready-made popup window was closed (X or window.close()): hide it instead of
+    destroying it, so the next download can reuse it at once. Never vetoes while quitting."""
+    try:
+        if getattr(G, "quit", False):
+            return True
+        with _WARM["lock"]:
+            win, pid = _WARM["win"], _WARM["pid"]
+            _WARM["busy"] = False
+            _WARM["pid"] = None
+        if pid:
+            G.popups.pop(pid, None)
+        if win is not None:
+            win.hide()
+    except Exception:
+        pass
+    return False
+
+
 def _open_popup_window(pid, link):
-    """Create the popup window on a background thread: opening a native window can take a
+    """Show the popup window on a background thread: opening a native window can take a
     second or two, and the request that asked for it (/add, /video/get) must answer at once
     so the browser extension is not left waiting."""
     try:
         if G.win is not None and not G.win_closed:              # the program's own window loop is running
             try:
                 import webview
+                # IDM-style instant popup: reuse the pre-created hidden window when free
+                with _WARM["lock"]:
+                    w, busy = _WARM["win"], _WARM["busy"]
+                    if w is not None and not busy:
+                        _WARM["busy"] = True
+                        _WARM["pid"] = pid
+                if w is not None and not busy:
+                    try:
+                        w.load_url(link)
+                        w.show()
+                        G.popups[pid] = w
+                        return
+                    except Exception:
+                        with _WARM["lock"]:
+                            _WARM["busy"] = False
+                            _WARM["pid"] = None
+                        # fall through to a fresh window below
                 win = webview.create_window(APP_NAME, link, width=800, height=660)
                 G.popups[pid] = win
                 win.events.closed += lambda *a: G.popups.pop(pid, None)
@@ -4187,7 +4245,12 @@ def _install_update():
             f.write(f'"{dl["path"]}" /SILENT\r\n')
             f.write(f'start "" "{sys.executable}"\r\n')
             f.write('(goto) 2>nul & del "%~f0"\r\n')
-        os.startfile(bat)
+        try:
+            subprocess.Popen(["cmd.exe", "/c", bat],
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            os.startfile(bat)      # fallback: the old visible console, rather than a failed update
     except Exception as e:
         return {"ok": False, "error": str(e)[:120]}
     threading.Thread(target=lambda: (time.sleep(1.5), quit_app()), daemon=True).start()
@@ -4311,6 +4374,7 @@ def main():
     threading.Thread(target=clip_loop, daemon=True).start()
     threading.Thread(target=_auto_update_check, daemon=True).start()
     threading.Thread(target=_refresh_icon_cache_once, daemon=True).start()
+    threading.Thread(target=_warm_popup_window, daemon=True).start()
     tray = CFG["tray"] and setup_tray()
     if CFG["tray"] and not tray and IS_WIN:
         # the tray icon is what keeps UDM alive after closing the window: if it could
