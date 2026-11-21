@@ -3144,7 +3144,7 @@ import webbrowser
 
 G = types.SimpleNamespace(mgr=None, last_poll=0.0, started=time.time(), events=[], incoming=[], quit=False,
                           tray=None, proc=None, prev={}, last_clip="", server=None, notified=False, videos=[], ext={},
-                          pending={}, last_popup=0.0, recent={}, win=None, win_closed=False, want_ui=False,
+                          pending={}, last_popup=0.0, recent={}, win=None, win_closed=False, want_ui=False, popups={},
                           build_no=0, update=None, update_dl=None)
 KINDS = {}
 
@@ -3254,7 +3254,9 @@ def popup_alive():
 
 
 def open_popup(url, referer="", cookies="", video=None):
-    """The small window of one download (file information, then live progress), like a classic download manager."""
+    """The small window of one download (file information, then live progress), like a classic download manager.
+    It is the program's own window (pywebview, same as the main window) — not a browser window at all.
+    A browser is only a fallback for when the program's own window loop is not running."""
     now = time.time()
     if now - G.recent.get(url, 0) < 4:                      # the browser may report the same click twice
         return
@@ -3265,6 +3267,15 @@ def open_popup(url, referer="", cookies="", video=None):
         G.pending.pop(k, None)
     G.last_popup = now
     link = f"http://127.0.0.1:{CFG['server_port']}/popup?token={CFG['token']}&pid={pid}"
+    if G.win is not None and not G.win_closed:              # the program's own window loop is running
+        try:
+            import webview
+            win = webview.create_window(APP_NAME, link, width=800, height=660)
+            G.popups[pid] = win
+            win.events.closed += lambda *a: G.popups.pop(pid, None)
+            return pid
+        except Exception:
+            pass
     exe, (sw, sh), (w, h) = find_browser(), screen_size(), (800, 660)
     if exe:
         try:
