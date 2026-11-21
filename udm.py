@@ -2352,11 +2352,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/video/get" and body.get("url") and G.mgr:
             try:
                 mp3 = body.get("ext") == "mp3"
-                G.mgr.add_task(new_video_task(body["url"], {"height": body.get("h") or 0, "cont": "mp3" if mp3 else body.get("ext") or "mp4",
-                                                            "title": body.get("title", ""), "thumb": body.get("thumb", ""), "size": body.get("size"),
-                                                            "referer": body.get("referer", ""), "cookies": body.get("cookies", ""),
-                                                            "fid": body.get("fid", ""), "muxed": body.get("muxed")}), start=True)
-                G.events.append({"k": "info", "name": body.get("title") or body["url"], "msg": "Video download started"})
+                b = {"height": body.get("h") or 0, "cont": "mp3" if mp3 else body.get("ext") or "mp4",
+                     "title": body.get("title", ""), "thumb": body.get("thumb", ""), "size": body.get("size"),
+                     "referer": body.get("referer", ""), "cookies": body.get("cookies", ""),
+                     "fid": body.get("fid", ""), "muxed": body.get("muxed")}
+                if CFG.get("silent") or not CFG.get("popup_dialog", True):
+                    G.mgr.add_task(new_video_task(body["url"], b), start=True)
+                    G.events.append({"k": "info", "name": body.get("title") or body["url"], "msg": "Video download started"})
+                else:                       # ask first: the small File Information window (like a plain file)
+                    open_popup(body["url"], b["referer"], b["cookies"],
+                               video={**b, "folder": "", "start": "", "end": "", "exact": False, "subs": ""})
                 return self._send(200, b'{"ok":true}')
             except Exception as e:
                 return self._send(200, json.dumps({"err": str(e)[:200]}).encode())
@@ -3647,7 +3652,7 @@ def ui_act(b):
         v = {"height": int(b.get("height") or 0), "cont": (b.get("cont") or "mp4"), "title": b.get("title") or "",
              "size": b.get("size"), "thumb": b.get("thumb") or "", "folder": (b.get("folder") or "").strip(),
              "start": b.get("start") or "", "end": b.get("end") or "", "exact": bool(b.get("exact")),
-             "subs": b.get("subs") or ""}
+             "subs": b.get("subs") or "", "fid": b.get("fid") or "", "muxed": bool(b.get("muxed"))}
         open_popup(b["url"].strip(), b.get("referer", ""), b.get("cookies", ""), video=v)
         return {"ok": True}
     elif op == "vdl":
@@ -4042,15 +4047,14 @@ def _refresh_icon_cache_once():
 
 
 def _auto_update_check():
-    """Check once at startup (at most every 6 hours) when the setting is on."""
-    if not CFG.get("auto_update_check", True):
-        return
-    if time.time() - CFG.get("last_update_check", 0) < 6 * 3600:
-        return
-    try:
-        check_for_updates()
-    except Exception:
-        pass
+    """Check at startup and then once an hour while the program runs (at most every hour)."""
+    while True:
+        try:
+            if CFG.get("auto_update_check", True) and time.time() - CFG.get("last_update_check", 0) >= 3600:
+                check_for_updates()
+        except Exception:
+            pass
+        time.sleep(3600)
 
 
 def _download_update():
