@@ -78,6 +78,7 @@ jobs:
           --hidden-import webview
           --collect-data webview
           --collect-submodules pystray
+          --collect-all pystray
           udm.py
 
       - name: Build the browser host (udm-host.exe)
