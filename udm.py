@@ -8716,6 +8716,8 @@ html[dir=rtl] .urlbar input{direction:ltr}
 .urlbar input::placeholder{color:#a9bde6;opacity:.9}.urlbar .chev{background:none;color:var(--tx);width:32px;height:32px;border-radius:8px;display:grid;place-items:center}.urlbar .chev:hover{background:var(--hov)}
 .dlbtn{height:clamp(50px,6.4vh,64px);padding:0 clamp(22px,2.6vw,42px);border-radius:16px;background:linear-gradient(180deg,#2a8cff,#0d56ff);color:#fff;font-weight:700;font-size:clamp(15px,1.45vw,22px);display:flex;align-items:center;gap:12px;box-shadow:0 0 30px rgba(30,110,255,.7),inset 0 1px 0 rgba(255,255,255,.4);border:1px solid rgba(140,190,255,.7);transition:.15s;white-space:nowrap}
 .dlbtn:hover{filter:brightness(1.12);transform:translateY(-1px)}.dlbtn:active{transform:none}
+.btn{height:38px;padding:0 22px;border-radius:9px;background:rgba(60,78,150,.4);border:1px solid var(--bd);color:#fff;font-weight:500;transition:.15s;display:inline-flex;align-items:center;gap:9px;white-space:nowrap}.btn:hover{background:rgba(90,120,230,.45)}
+.btn.pri{background:linear-gradient(180deg,#3b86ff,#1d5cf0);border-color:rgba(150,190,255,.6);box-shadow:0 0 18px rgba(50,110,255,.55);font-weight:600}.btn.pri:hover{filter:brightness(1.12)}.btn:disabled{opacity:.5;pointer-events:none}
 /* sidebar */
 aside{grid-column:1;grid-row:2;position:relative;padding:clamp(8px,1.6vh,18px) 16px 0 26px;display:flex;flex-direction:column;min-height:0;overflow:hidden}
 .nv{display:flex;align-items:center;gap:16px;min-height:clamp(46px,6.6vh,62px);padding:0 18px;border-radius:18px;cursor:pointer;font-size:clamp(14px,1.2vw,18px);border:1px solid transparent;margin-bottom:clamp(4px,1vh,10px);position:relative;z-index:2;transition:background .15s}
