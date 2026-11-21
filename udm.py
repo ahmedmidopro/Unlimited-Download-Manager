@@ -2518,16 +2518,16 @@ function note(msg) { lastCap = new Date().toLocaleTimeString() + "  " + msg; hel
 let rulesOk = false;
 async function loadRules() { const r = await call("rules"); if (r && r.data && r.data.types) { rules = r.data; rulesOk = true; } else rulesOk = false; }
 const nameOf = (x) => ((x.filename || x.finalUrl || x.url || "").split(/[\\/]/).pop() || "").split("?")[0];
-B.downloads.onCreated.addListener(async (item) => {
-  if (item.byExtensionId) return;
+async function decideDownload(item) {           // null = leave it to the browser
+  if (item.byExtensionId) return null;
   await loadRules();
-  if (!rulesOk) return note("UDM did not answer, so the browser kept the download");
-  if (!rules.enabled) return note("capture is switched off in UDM");
+  if (!rulesOk) { note("UDM did not answer, so the browser kept the download"); return null; }
+  if (!rules.enabled) { note("capture is switched off in UDM"); return null; }
   let it = item;
   const url = it.finalUrl || it.url;
-  if (!/^(https?|ftp):/i.test(url)) return;                 // blob: / data: / file: stay in the browser
+  if (!/^(https?|ftp):/i.test(url)) return null;                 // blob: / data: / file: stay in the browser
   let host = ""; try { host = new URL(url).hostname; } catch (e) {}
-  if (rules.excluded_sites.some((p) => wc(p).test(host)) || rules.exceptions.some((p) => wc(p).test(url))) return note("skipped (excluded site / URL): " + host);
+  if (rules.excluded_sites.some((p) => wc(p).test(host)) || rules.exceptions.some((p) => wc(p).test(url))) { note("skipped (excluded site / URL): " + host); return null; }
   let ext = (nameOf(it).split(".").pop() || "").toLowerCase();
   if (!rules.types.includes(ext)) {                         // the real file name is often not known yet: look again
     await new Promise((r) => setTimeout(r, 600));
@@ -2536,11 +2536,39 @@ B.downloads.onCreated.addListener(async (item) => {
   }
   const bytes = it.totalBytes || it.fileSize || 0, bigMb = rules.large_mb || 0;
   const big = bigMb > 0 && bytes >= bigMb * 1048576 && !/^text\//i.test(it.mime || "");
-  if (rules.excluded_types.includes(ext)) return note('skipped (excluded type "' + ext + '")');
-  if (!rules.types.includes(ext) && !big) return note('skipped: type "' + ext + '" is not in the capture list' + (bigMb ? " and the file is smaller than " + bigMb + " MB" : ""));
-  const r = await call("add", {url, referer: it.referrer || "", cookies: await cookieHeader(url)});
-  if (r) { B.downloads.cancel(item.id); B.downloads.erase({id: item.id}); note("sent to UDM: " + nameOf(it)); }
-  else note("UDM did not answer, so the browser kept: " + nameOf(it));
+  if (rules.excluded_types.includes(ext)) { note('skipped (excluded type "' + ext + '")'); return null; }
+  if (!rules.types.includes(ext) && !big) { note('skipped: type "' + ext + '" is not in the capture list' + (bigMb ? " and the file is smaller than " + bigMb + " MB" : "")); return null; }
+  return {url, referer: it.referrer || "", name: nameOf(it)};
+}
+async function sendDownload(item, d) {          // true once UDM has it and the browser copy is gone
+  const r = await call("add", {url: d.url, referer: d.referer, cookies: await cookieHeader(d.url)});
+  if (!r) { note("UDM did not answer, so the browser kept: " + d.name); return false; }
+  B.downloads.cancel(item.id); B.downloads.erase({id: item.id}); note("sent to UDM: " + d.name);
+  return true;
+}
+// Chrome, Edge, Brave, Opera: decide before the browser asks where to save
+// it, so its own "Save as" window never shows up for files UDM takes. The
+// browser's download waits meanwhile and goes on if UDM does not take it.
+const DECIDE_EARLY = !!(B.downloads.onDeterminingFilename && B.downloads.onDeterminingFilename.addListener);
+if (DECIDE_EARLY) {
+  B.downloads.onDeterminingFilename.addListener((item, suggest) => {
+    let answered = false;
+    const keep = () => { if (!answered) { answered = true; try { suggest(); } catch (e) {} } };
+    const guard = setTimeout(keep, 9000);       // never leave the browser waiting long
+    decideDownload(item).then(async (d) => {
+      if (!d) { clearTimeout(guard); keep(); return; }
+      const ok = await sendDownload(item, d);
+      clearTimeout(guard);
+      if (ok) answered = true;                  // taken: no suggest, no "Save as" window
+      else keep();
+    }).catch(() => { clearTimeout(guard); keep(); });
+    return true; // answered later
+  });
+}
+B.downloads.onCreated.addListener(async (item) => {
+  if (DECIDE_EARLY) return;                     // the early path already owns it
+  const d = await decideDownload(item);
+  if (d) await sendDownload(item, d);
 });
 
 /* ---- "Download with UDM" buttons inside web pages (content.js) ---- */
@@ -2799,7 +2827,7 @@ button{font:inherit;color:inherit;border:0;background:none;cursor:pointer;paddin
 
 
 # ====================================================================== browser integration (installed from inside UDM, no store)
-EXT_VERSION = "1.5.0"
+EXT_VERSION = "1.5.1"
 HOST_NAME = "com.udm.host"
 EXT_PUBKEY = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAx16FSZLkwo6Ru2hW/X3+uaeZoxojJzWekIRjNWI9SlH4wFiw7U98Ye2Zj7fxUCKRJ7HJbhjSgNMMMWNrST0ZWq5UKvj4aZIVUpCnwwfQdC+05W46uMtqOKh005v7umzm0uYyt3SEK02QYJ2skZeGTD22hDKkaACqWPU0AtVYKiiy5w79aROgjEqq4rooreJH8HBnlM4OVtqn5C159jNDUeoM632Oq+er2qXrD84Ief12gq20gOgLINnkrFvpBI9hifNVq25avAHMwMvSlG8bcVfHvjkVM8dgbBMFZRquPddqEFf3WDTBp7Hs4i/2/ZiaRd222NzO1cL5EakXQw/2+QIDAQAB"
 EXT_ID_FIREFOX = "udm@unlimited.download.manager"
