@@ -1,0 +1,134 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+      AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Install Python 3.12 (64-bit)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download yt-dlp, Deno and FFmpeg (bundled inside the app)
+        shell: pwsh
+        run: |
+          function Test-Checksum {
+            param([string]$File, [string]$ChecksumUrl, [string]$Pattern = "")
+            try {
+              $txt = (Invoke-WebRequest -Uri $ChecksumUrl -UseBasicParsing).Content
+            } catch {
+              Write-Warning "Could not download checksum from $ChecksumUrl — skipping verification for $File"
+              return
+            }
+            $line = $txt
+            if ($Pattern) {
+              $line = ($txt -split "`n" | Where-Object { $_ -match [regex]::Escape($Pattern) } | Select-Object -First 1)
+              if (-not $line) { Write-Warning "No checksum line for $Pattern — skipping verification for $File"; return }
+            }
+            $want = ($line -split "\s+" | Select-Object -First 1).ToLower()
+            $got = (Get-FileHash -Algorithm SHA256 -Path $File).Hash.ToLower()
+            if ($want -ne $got) { throw "SHA-256 mismatch for $File (downloaded file is not the official one)" }
+            Write-Host "SHA-256 verified: $File"
+          }
+          New-Item -ItemType Directory -Force tools | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" -OutFile tools/yt-dlp.exe
+          Test-Checksum tools/yt-dlp.exe "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS" "yt-dlp.exe"
+          Invoke-WebRequest -Uri "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" -OutFile deno.zip
+          Test-Checksum deno.zip "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip.sha256"
+          Expand-Archive deno.zip -DestinationPath deno_tmp -Force
+          Copy-Item deno_tmp/deno.exe tools/deno.exe
+          try {
+            Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+            Test-Checksum ffmpeg.zip "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256"
+          } catch {
+            Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile ffmpeg.zip
+            Test-Checksum ffmpeg.zip "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip.sha256"
+          }
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp -Force
+          Copy-Item (Get-ChildItem ffmpeg_tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1).FullName tools/ffmpeg.exe
+          foreach ($f in "yt-dlp.exe","deno.exe","ffmpeg.exe") { if (!(Test-Path "tools/$f")) { throw "$f is missing" } }
+          Get-ChildItem tools | Select-Object Name, Length
+
+      - name: Build the app folder with PyInstaller
+        run: >
+          pyinstaller --noconfirm --clean --onedir --windowed
+          --name UDM
+          --icon assets/udm.ico
+          --hidden-import pystray._win32
+          --hidden-import webview
+          --collect-data webview
+          --collect-submodules pystray
+          udm.py
+
+      - name: Build the browser host (udm-host.exe)
+        run: >
+          pyinstaller --noconfirm --clean --onedir --console
+          --name udm-host
+          --icon assets/udm.ico
+          udm_host.py
+
+      - name: Sign the Firefox add-on (optional - needs Mozilla API keys in the repository secrets)
+        if: env.AMO_JWT_ISSUER != ''
+        shell: pwsh
+        env:
+          UDM_EXT_VERSION: 1.3.${{ github.run_number }}
+        run: |
+          python udm.py --write-extension build/fx firefox --no-token
+          npx --yes web-ext sign --source-dir build/fx --channel unlisted --api-key "$env:AMO_JWT_ISSUER" --api-secret "$env:AMO_JWT_SECRET" --artifacts-dir build/signed
+          New-Item -ItemType Directory -Force dist/UDM/extension | Out-Null
+          Copy-Item (Get-ChildItem build/signed -Filter *.xpi | Select-Object -First 1).FullName dist/UDM/extension/udm-firefox-signed.xpi
+
+      - name: Add the tools next to UDM.exe
+        shell: pwsh
+        run: |
+          Copy-Item tools dist/UDM/tools -Recurse
+          Copy-Item dist/udm-host dist/UDM/host -Recurse
+          if (!(Test-Path dist/UDM/host/udm-host.exe)) { throw "udm-host.exe was not created" }
+          if (!(Test-Path dist/UDM/UDM.exe)) { throw "dist/UDM/UDM.exe was not created" }
+          Compress-Archive -Path dist/UDM/* -DestinationPath UDM-Portable.zip
+          Get-Item UDM-Portable.zip | Select-Object Name, Length
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build Setup.exe installer
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=1.1.${{ github.run_number }}" installer.iss
+          if (!(Test-Path installer_output\UDM-Setup.exe)) { throw "UDM-Setup.exe was not created" }
+
+      - name: Save files as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: UDM-Windows
+          path: |
+            installer_output/UDM-Setup.exe
+            UDM-Portable.zip
+
+      - name: Publish a Release with direct download links
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Unlimited Download Manager build ${{ github.run_number }}
+          files: |
+            installer_output/UDM-Setup.exe
+            UDM-Portable.zip
