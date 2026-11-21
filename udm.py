@@ -3166,8 +3166,8 @@ def find_browser():
         for env in ("ProgramFiles(x86)", "ProgramFiles", "LocalAppData"):
             b = os.environ.get(env)
             if b:
-                cands += [os.path.join(b, "Microsoft", "Edge", "Application", "msedge.exe"),
-                          os.path.join(b, "Google", "Chrome", "Application", "chrome.exe")]
+                cands += [os.path.join(b, "Google", "Chrome", "Application", "chrome.exe"),
+                          os.path.join(b, "Microsoft", "Edge", "Application", "msedge.exe")]
     else:
         cands = [shutil.which(x) or "" for x in ("microsoft-edge", "google-chrome", "chromium", "chromium-browser")]
     return next((c for c in cands if c and os.path.exists(c)), None)
@@ -8599,6 +8599,7 @@ $('#foot').innerHTML=`<button class="btn" id="cx">${L('cancel')}</button><div cl
 $('#cx').onclick=async()=>{await api('popup_cancel',{pid:PID});closeWin()};$('#chg').onclick=changeDir;
 $('#path').oninput=e=>{S.path=e.target.value;$('#nm').value=base(S.path);setTitle(base(S.path))};
 $('#cats').onclick=e=>{const b=e.target.closest('[data-c]');if(b)setCat(b.dataset.c,true)};$('#cn').onchange=e=>S.conn=e.target.value;$('#af').onchange=e=>S.after=e.target.value;
+const dc=[4,8,16,32].includes(I.conns)?String(I.conns):'32';$('#cn').value=dc;S.conn=dc;
 $('#nm').oninput=e=>{S.path=join(dir(S.path),e.target.value);$('#path').value=S.path};
 $('#go').onclick=()=>begin(false);$('#lt').onclick=()=>begin(true)}
 function setCat(c,move){S.cat=c;document.querySelectorAll('.chip').forEach(x=>x.classList.toggle('on',x.dataset.c==c));if(move){const f=I.cats.find(x=>x.name==c);if(f){S.path=join(f.folder,base(S.path));$('#path').value=S.path}}}
